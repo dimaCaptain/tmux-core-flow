@@ -1,0 +1,25 @@
+# Autoapprove policy — deny-list semantics.
+#
+# The PreToolUse hook AUTO-APPROVES every tool call EXCEPT those matching an
+# `always_ask` rule. A matched call falls back to a normal permission prompt
+# (you decide), it is NOT denied.
+#
+# Rule forms:
+#   "Bash(rm "        — tool Bash whose command contains the substring "rm "
+#   "Bash(git push)"  — tool Bash whose command contains "git push"
+#   "Edit"            — every call to the Edit tool (bare tool name)
+#
+# Ported from agent-control config/autoapprove.json.
+
+always_ask:
+  - "Bash(rm "
+  - "Bash(git push)"
+  - "Bash(git reset)"
+  - "Bash(git checkout --)"
+  - "Bash(git clean)"
+  - "Bash(docker rm)"
+  - "Bash(kill)"
+  - "Bash(sudo)"
+  - "Bash(curl -X DELETE)"
+  - "Bash(DROP TABLE)"
+  - "Bash(chmod 777)"
