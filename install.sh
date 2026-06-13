@@ -100,5 +100,5 @@ fi
 
 say ""
 say "done.$([ "$DRY" = 1 ] && echo ' (dry-run)')"
-say "NOTE: autoapprove only fires in agent panes where FLOW_AUTOAPPROVE=1 is set."
-say "      Add 'export FLOW_AUTOAPPROVE=1' to the agent launcher's pane env."
+say "NOTE: autoapprove is active in any tmux window (\$TMUX). Dangerous calls still"
+say "      prompt via always_ask. Set FLOW_AUTOAPPROVE=0 to opt a session out."

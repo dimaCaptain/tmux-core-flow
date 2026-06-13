@@ -36,9 +36,19 @@ The hook receives the exact `tool_name` + `tool_input` *before* any prompt:
 - default → `permissionDecision: "allow"` (runs silently)
 - matches an `always_ask` rule (`rm`, `sudo`, `git push`, …) → `"ask"` (prompts you)
 
-**Scoping safeguard:** auto-approval only happens when `FLOW_AUTOAPPROVE=1` is in
-the environment (set by the agent launcher in agent panes). In your own
-interactive session the variable is absent and the hook stays transparent.
+**Activation:** auto-approval is active for **any agent running inside tmux**
+(detected via `$TMUX`), so it works in every tmux window without per-launcher
+wiring. Overrides:
+
+| Env | Effect |
+|---|---|
+| _(inside tmux)_ | on |
+| _(outside tmux)_ | off (transparent) |
+| `FLOW_AUTOAPPROVE=1` | force on (even outside tmux) |
+| `FLOW_AUTOAPPROVE=0` | force off (escape hatch for one session) |
+
+This includes your own interactive session if it runs in tmux — dangerous calls
+still prompt via `always_ask`. Set `FLOW_AUTOAPPROVE=0` to opt a session out.
 
 ## Install
 
@@ -48,8 +58,8 @@ interactive session the variable is absent and the hook stays transparent.
 ./install.sh --dry-run  # preview
 ```
 
-Then, in the agent launcher, export `FLOW_AUTOAPPROVE=1` into agent panes so the
-hook activates for them (and only them).
+Auto-approval then works in every tmux window automatically (see Activation
+above) — no agent-launcher changes needed.
 
 ## Test
 

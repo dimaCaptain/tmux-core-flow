@@ -52,6 +52,24 @@ def test_missing_tool_name_is_transparent():
     assert out({}, RULES, enabled=True) is None
 
 
+# --- activation scoping: any tmux agent, with explicit overrides ---
+
+def test_enabled_inside_tmux_by_default():
+    assert hook.enabled_for({"TMUX": "/tmp/tmux-1000/default,123,0"}) is True
+
+
+def test_disabled_outside_tmux_by_default():
+    assert hook.enabled_for({}) is False
+
+
+def test_force_on_overrides_no_tmux():
+    assert hook.enabled_for({"FLOW_AUTOAPPROVE": "1"}) is True
+
+
+def test_force_off_overrides_tmux():
+    assert hook.enabled_for({"FLOW_AUTOAPPROVE": "0", "TMUX": "x"}) is False
+
+
 # --- end-to-end through the script via stdin/stdout ---
 
 def _run(stdin_obj, env_extra):

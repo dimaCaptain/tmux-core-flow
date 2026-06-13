@@ -59,8 +59,22 @@ def evaluate(event: dict, rules: dict, enabled: bool) -> dict | None:
     }
 
 
-def _enabled() -> bool:
-    return os.environ.get("FLOW_AUTOAPPROVE", "") == "1"
+def enabled_for(env) -> bool:
+    """Auto-approve is active for any agent running inside tmux.
+
+    Priority:
+      FLOW_AUTOAPPROVE=1  → force on  (any session, even outside tmux)
+      FLOW_AUTOAPPROVE=0  → force off (escape hatch for a given session)
+      otherwise           → on when inside tmux ($TMUX set), off elsewhere.
+
+    Dangerous calls still defer to you via always_ask regardless of this.
+    """
+    v = env.get("FLOW_AUTOAPPROVE")
+    if v == "1":
+        return True
+    if v == "0":
+        return False
+    return bool(env.get("TMUX"))
 
 
 def main() -> int:
@@ -74,7 +88,7 @@ def main() -> int:
     except Exception:
         rules = {"always_ask": []}
     try:
-        decision = evaluate(event, rules, _enabled())
+        decision = evaluate(event, rules, enabled_for(os.environ))
     except Exception:
         decision = None
     if decision is not None:
