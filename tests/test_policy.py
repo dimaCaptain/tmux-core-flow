@@ -91,6 +91,6 @@ def test_load_real_policy_file():
         "config", "policy.yaml",
     )
     rules = policy.load(path)
-    assert "Bash(rm " in rules["always_ask"]
+    assert "Bash(!rm " in rules["always_ask"]
     assert policy.decide("Bash", {"command": "rm -rf x"}, rules) == "ask"
     assert policy.decide("Bash", {"command": "echo hi"}, rules) == "allow"
