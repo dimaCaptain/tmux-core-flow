@@ -8,10 +8,11 @@ exact `tool_name` + `tool_input` before any prompt is shown.
 
 Scoping safeguard
 -----------------
-Auto-approval only happens when the environment variable FLOW_AUTOAPPROVE=1 is
-set (the agent launcher sets it in agent panes). In your own interactive Claude
-session the variable is absent, the hook stays transparent, and permission
-prompts behave normally.
+Auto-approval is active for any Claude session running inside tmux (detected via
+$TMUX). Outside tmux the hook stays transparent and permission prompts behave
+normally. FLOW_AUTOAPPROVE=1/0 forces it on/off for a single session. Dangerous
+calls always defer to you via `always_ask`, regardless of scope. See
+`enabled_for` for the precise rule.
 
 Contract
 --------

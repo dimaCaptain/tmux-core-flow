@@ -7,8 +7,8 @@ Renders one line per tmux window grouped by session:
      1. 🔴 stew          opus    3m
      2. 🟡 dev-main      v4-pro  12s
 
-Launched by hotkey via launch/dashboard.ps1 (Windows) → wsl → flow-dashboard.
-Refreshes in place without flicker. `q` quits, `--once` prints a single frame.
+Launched by hotkey via launch/launch-flow-dashboard.ps1 (Windows) → wsl →
+flow-dashboard. Refreshes in place without flicker; `--once` prints one frame.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def render() -> str:
             name = a.name[:14]
             out.append(f"{color}{a.index:>2}. {a.dot} {name:<14} "
                        f"{a.model:<10} {a.elapsed:<6}{RESET}")
-    out.append(f"{DIM}[q=quit]{RESET}")
+    out.append(f"{DIM}[Ctrl+C=quit]{RESET}")
     return "\n".join(out) + "\n"
 
 

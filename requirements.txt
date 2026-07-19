@@ -1,0 +1,2 @@
+# Runtime dependencies for tmux-core-flow.
+PyYAML>=6.0
