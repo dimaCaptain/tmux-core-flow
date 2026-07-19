@@ -22,6 +22,10 @@ terminal screen-scraping, no simulated keypresses. State is read straight from
 each agent's transcript, and the approve/ask decision is a pure function of the
 structured tool call — so it's testable and race-free.
 
+<p align="center">
+  <img src="docs/dashboard.svg" alt="tmux-core-flow dashboard: one line per agent, colored by state, with model and elapsed time" width="480">
+</p>
+
 ## Architecture
 
 ```
