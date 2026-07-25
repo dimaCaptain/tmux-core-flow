@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Put Claude sessions back into the tmux windows they came from.
+
+Reads the index maintained by `flow-session-index` and, for each window that
+had a session but no longer runs one, produces `claude --resume <uuid>`.
+
+Nothing starts by itself. The default is a plan you can read, and even `--arm`
+only types the command into the window and leaves it for you to press Enter.
+That is deliberate: resuming every window at once means dozens of agents
+launching simultaneously, which is how this ends up in swap. `--run` exists for
+when you do want them started, and it goes in batches with a pause.
+
+Usage:
+    flow-restore                       what could be restored (default)
+    flow-restore --arm --all           type the command into every window
+    flow-restore --arm pet-projects:3  ...into one window
+    flow-restore --run --all           actually start them, batched
+    flow-restore --candidates          TSV for scripts (the picker uses this)
+
+Options:
+    --batch N   windows to start per batch with --run (default 3)
+    --pause S   seconds between batches (default 5)
+
+A window already running Claude is never touched.
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_LIB = os.path.join(_ROOT, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+import flow_sessions as fs  # noqa: E402
+
+STATE_DIR = os.environ.get("FLOW_STATE_DIR") or os.path.expanduser("~/.tmux")
+PROJECTS_DIR = os.environ.get("FLOW_CLAUDE_PROJECTS") or os.path.expanduser("~/.claude/projects")
+INDEX = os.path.join(STATE_DIR, "claude-sessions.tsv")
+
+LIVE = "live"           # already running Claude — leave alone
+RESTORABLE = "restorable"
+GONE = "gone"           # the window itself is no longer there
+
+_FORMAT = "#{session_name}:#{window_index}\t#{pane_current_path}\t#{pane_current_command}"
+
+
+def tmux(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=10)
+
+
+def live_windows() -> dict[str, tuple[str, str]]:
+    """target -> (cwd, current command) for every window tmux currently has."""
+    try:
+        out = tmux("list-windows", "-a", "-F", _FORMAT)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+    windows = {}
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            windows[parts[0]] = (parts[1], parts[2])
+    return windows
+
+
+def transcript_exists(uuid: str, cwd: str) -> bool:
+    return os.path.exists(os.path.join(PROJECTS_DIR, fs.project_dir(cwd), f"{uuid}.jsonl"))
+
+
+def classify(rows: list[fs.Row], windows: dict[str, tuple[str, str]]) -> list[tuple[fs.Row, str]]:
+    """Pair each indexed session with what is currently true of its window."""
+    out = []
+    for row in rows:
+        if row.target not in windows:
+            out.append((row, GONE))
+            continue
+        _, command = windows[row.target]
+        out.append((row, LIVE if command == "claude" else RESTORABLE))
+    return out
+
+
+def resume_command(row: fs.Row, window_cwd: str) -> str:
+    """The command to type. Includes a `cd` when the window drifted elsewhere,
+    because `--resume` only finds a session from its own project directory."""
+    resume = f"claude --resume {row.uuid}"
+    if window_cwd != row.cwd:
+        return f"cd {shlex.quote(row.cwd)} && {resume}"
+    return resume
+
+
+def send(target: str, command: str, execute: bool) -> None:
+    tmux("send-keys", "-t", target, "C-u")  # clear whatever is on the prompt
+    tmux("send-keys", "-t", target, "-l", command)
+    if execute:
+        tmux("send-keys", "-t", target, "Enter")
+
+
+def select(pairs, targets: list[str], want_all: bool) -> list[tuple[fs.Row, str]]:
+    chosen = [(r, s) for r, s in pairs if s == RESTORABLE]
+    if not want_all:
+        chosen = [(r, s) for r, s in chosen if r.target in targets]
+    return chosen
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return 0
+
+    mode = "plan"
+    batch, pause = 3, 5.0
+    want_all = False
+    targets: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--plan", "--arm", "--run", "--candidates"):
+            mode = a.lstrip("-")
+        elif a == "--all":
+            want_all = True
+        elif a == "--batch" and i + 1 < len(args):
+            i += 1
+            batch = max(1, int(args[i]))
+        elif a == "--pause" and i + 1 < len(args):
+            i += 1
+            pause = max(0.0, float(args[i]))
+        elif a.startswith("-"):
+            sys.stderr.write(f"flow-restore: unknown option {a!r}\n")
+            return 2
+        else:
+            targets.append(a)
+        i += 1
+
+    try:
+        with open(INDEX) as f:
+            rows = fs.parse_index(f.read())
+    except OSError:
+        sys.stderr.write(
+            f"flow-restore: no index at {INDEX}\n"
+            "run flow-session-index first\n"
+        )
+        return 1
+
+    rows = [r for r in rows if transcript_exists(r.uuid, r.cwd)]
+    windows = live_windows()
+    pairs = classify(rows, windows)
+    now = int(time.time())
+
+    if mode == "candidates":
+        for row, state in sorted(pairs, key=lambda p: (-p[0].activity, p[0].target)):
+            project = row.cwd.rstrip("/").split("/")[-1] or "/"
+            print("\t".join((row.target, row.window, project, row.cwd,
+                             row.uuid, str(row.activity), state)))
+        return 0
+
+    chosen = select(pairs, targets, want_all)
+
+    if mode == "plan":
+        restorable = [p for p in pairs if p[1] == RESTORABLE]
+        live = [p for p in pairs if p[1] == LIVE]
+        if not restorable:
+            print(f"Nothing to restore ({len(live)} window(s) already running Claude).")
+            return 0
+        print(f"{len(restorable)} session(s) can be restored:\n")
+        for row, _ in sorted(restorable, key=lambda p: (-p[0].activity, p[0].target)):
+            cwd_now = windows[row.target][0]
+            age = fs.humanize(now - row.activity)
+            print(f"  {row.target:<16} {row.window:<12} {age:>4} ago   "
+                  f"{resume_command(row, cwd_now)}")
+        if live:
+            print(f"\n{len(live)} window(s) already running Claude, left alone.")
+        print("\n--arm to type these in, --run to start them, --all for every window.")
+        return 0
+
+    if not chosen:
+        if targets:
+            print("No restorable session for: " + ", ".join(targets))
+        else:
+            print("Nothing selected. Pass window targets or --all.")
+        return 1
+
+    chosen.sort(key=lambda p: (-p[0].activity, p[0].target))
+
+    if mode == "arm":
+        for row, _ in chosen:
+            send(row.target, resume_command(row, windows[row.target][0]), execute=False)
+        print(f"Typed the resume command into {len(chosen)} window(s). "
+              "Press Enter in the ones you want.")
+        return 0
+
+    # --run: start them, a few at a time
+    for start in range(0, len(chosen), batch):
+        group = chosen[start:start + batch]
+        for row, _ in group:
+            send(row.target, resume_command(row, windows[row.target][0]), execute=True)
+            print(f"  started {row.target} ({row.window})")
+        if start + batch < len(chosen):
+            time.sleep(pause)
+    print(f"Started {len(chosen)} session(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception as exc:
+        sys.stderr.write(f"flow-restore: {exc}\n")
+        sys.exit(1)

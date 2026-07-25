@@ -83,8 +83,54 @@ Given a UUID you can read the transcript at:
 Prefer `pid__*` when you have the pane PID — it is unambiguous. Fall back to the
 name key otherwise.
 
+## 4. Session index — `~/.tmux/claude-sessions.tsv`
+
+The three surfaces above describe *now*. This one describes *what was there*,
+so it still answers after a reboot — when tmux comes back (via resurrect or
+continuum) but every Claude process is gone.
+
+Maintained by `flow-session-index`, which joins live tmux windows against
+`claude-map` and the transcripts. Tab-separated, one session per line, newest
+activity first:
+
+```
+#target	window	cwd	uuid	activity	seen
+pet-projects:3	claude	/home/you/work/proj	3bcad249-…	1784998162	1784998308
+```
+
+| Column | Meaning |
+|---|---|
+| `target` | tmux `session:index` the session ran in |
+| `window` | window name, for recognising it in a list |
+| `cwd` | working directory — `claude --resume` only resolves from here |
+| `uuid` | the argument to `claude --resume` |
+| `activity` | epoch of the last transcript write |
+| `seen` | epoch this row was last confirmed against a live window |
+
+Two rules make it durable, and both exist because the obvious implementation
+fails at exactly these points:
+
+- **Nothing is derived from running processes.** A snapshot built from live
+  PIDs rebuilds itself into nothing once those processes are gone — which is
+  precisely when you need it.
+- **A refresh merges, it never truncates.** An empty reading means "tmux is not
+  up yet", not "everything ended". Rows are retained until `seen` goes 30 days
+  stale, so a window you closed stays resumable.
+
+A row is dropped when its transcript no longer exists: an entry you cannot
+resume is worse than no entry.
+
+`~/.tmux/claude-sessions.txt` is the same data rendered for humans — every line
+is a pasteable `claude --resume` command, because the recovery path has to work
+when everything fancier is broken.
+
+`flow-restore` consumes the index; `flow-restore --candidates` re-emits it with
+a `live` / `restorable` / `gone` verdict per row if you want to build your own
+picker.
+
 ## Stability
 
-The colours, the four keys, and the two map filenames are the public surface and
-will not change silently. The rest — the internal order of checks, how the hook
-finds its window by walking the PPID chain — is free to change.
+The colours, the four keys, the two map filenames, and the session index columns
+are the public surface and will not change silently. The rest — the internal
+order of checks, how the hook finds its window by walking the PPID chain — is
+free to change.

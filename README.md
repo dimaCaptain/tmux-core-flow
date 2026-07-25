@@ -17,6 +17,8 @@ keypresses, no background daemon.
    timestamps and a pane→session map to disk.
 2. **Permissions** — `flow-approve` is a `PreToolUse` hook that auto-approves
    tool calls except those matching an `always_ask` deny-list.
+3. **Survival** — `flow-session-index` records which session ran in which
+   window, so a reboot does not cost you the context of a dozen agents.
 
 ## No dashboard here — on purpose
 
@@ -80,6 +82,46 @@ Rule forms in `policy.yaml`:
 This includes your own interactive session if it runs in tmux — dangerous calls
 still prompt via `always_ask`.
 
+## Surviving a reboot
+
+tmux comes back — [resurrect](https://github.com/tmux-plugins/tmux-resurrect)
+and [continuum](https://github.com/tmux-plugins/tmux-continuum) restore your
+windows. The Claude processes in them do not, and with twenty agents that is a
+lot of context to rebuild by hand.
+
+Everything needed to bring them back is already on disk: `claude-hook-notify`
+recorded which session UUID ran in which window, and the transcript is still
+there. `flow-session-index` joins the two into
+[`~/.tmux/claude-sessions.tsv`](docs/state-format.md#4-session-index--tmuxclaude-sessionstsv)
+and keeps it correct across a reboot, because it derives nothing from running
+processes and a refresh merges rather than truncates.
+
+Then, once tmux is back:
+
+```console
+$ flow-restore
+9 session(s) can be restored:
+
+  main:6      Irbi        8h ago   claude --resume 82e05302-…
+  yasno:2     stew       10d ago   claude --resume a7094bbe-…
+  …
+4 window(s) already running Claude, left alone.
+```
+
+```bash
+flow-restore --arm --all     # type the command into each window, don't run it
+flow-restore --run --all     # actually start them, 3 at a time
+flow-restore --arm yasno:2   # just this one
+```
+
+**`--arm` is the default habit worth forming.** It types the resume command and
+leaves the cursor there, so you press Enter only in the windows you actually
+open. Nothing starts on its own — resuming twenty agents simultaneously will
+put the machine into swap, which is why restoring is a choice here and not a
+boot-time side effect. `--run` batches for the same reason.
+
+A window already running Claude is never touched.
+
 ## Install
 
 ```bash
@@ -107,13 +149,16 @@ Requires `tmux`, `jq`, Python **3.10+** and PyYAML.
 bin/
   claude-hook-notify   state machine: hook events -> tab colour + state files
   flow-approve         PreToolUse entrypoint (stdin JSON -> allow/ask)
+  flow-session-index   durable window -> session index (run from cron)
+  flow-restore         put sessions back after a reboot
 lib/
   flow_policy.py       deny-list decision engine — pure, no I/O
+  flow_sessions.py     index merge/render rules — pure, no I/O
 config/
   policy.example.yaml  starting rules; yours live in ~/.config/tmux-core-flow/
   tmux-monitoring.conf fragment to source from your own ~/.tmux.conf
 docs/
-  state-format.md      the contract: colours, timestamps, session map
+  state-format.md      the contract: colours, timestamps, session map, index
 ```
 
 ## Development
@@ -123,6 +168,9 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-`flow_policy.decide` and the hook's `evaluate`/`enabled_for` are pure functions
-over their inputs, which is what the suite exercises — including that a
-malformed event can never crash the agent. CI runs it on Python 3.10–3.13.
+`flow_policy.decide`, the hook's `evaluate`/`enabled_for`, and the index merge
+rules are pure functions over their inputs, which is what the suite exercises —
+including that a malformed event can never crash the agent, and that an empty
+reading never empties the session index. One test drives a throwaway tmux server
+to prove `--arm` types its command without executing it; it skips where tmux is
+absent. CI runs the suite on Python 3.10–3.13.

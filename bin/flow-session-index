@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Maintain the durable index of Claude sessions per tmux window.
+
+Joins three things that already exist on disk and writes down the answer:
+
+    tmux windows          which windows exist, their name and working directory
+    ~/.tmux/claude-map/   working directory + window name -> session UUID
+    ~/.claude/projects/   the transcript, whose mtime is "last did work"
+
+Run it from cron. After a reboot the index still describes what was there,
+because none of its inputs depend on a running process — which is precisely how
+the mechanism it replaces lost everything.
+
+Usage:
+    flow-session-index              refresh the index (what cron runs)
+    flow-session-index --render     print the human view
+    flow-session-index --list       print the TSV, for scripts
+    flow-session-index --path       print where the index lives
+
+Writes:
+    ~/.tmux/claude-sessions.tsv     the index itself
+    ~/.tmux/claude-sessions.txt     human view, what the `cls` alias shows
+
+Both are rewritten atomically, and a refresh only ever merges — see
+lib/flow_sessions.merge.
+"""
+from __future__ import annotations
+
+import glob
+import os
+import subprocess
+import sys
+import time
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_LIB = os.path.join(_ROOT, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+import flow_sessions as fs  # noqa: E402
+
+STATE_DIR = os.environ.get("FLOW_STATE_DIR") or os.path.expanduser("~/.tmux")
+PROJECTS_DIR = os.environ.get("FLOW_CLAUDE_PROJECTS") or os.path.expanduser("~/.claude/projects")
+
+INDEX = os.path.join(STATE_DIR, "claude-sessions.tsv")
+HUMAN = os.path.join(STATE_DIR, "claude-sessions.txt")
+MAP_DIR = os.path.join(STATE_DIR, "claude-map")
+
+# tmux gives us the active pane of each window, which is the one a session runs in.
+_FORMAT = "#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{pane_pid}"
+
+
+def tmux_windows() -> list[tuple[str, str, str, str]]:
+    """(target, window_name, cwd, pane_pid) for every window, or [] if no server."""
+    try:
+        out = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F", _FORMAT],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4:
+            rows.append((parts[0], parts[1], parts[2], parts[3]))
+    return rows
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def lookup_uuid(cwd: str, window: str, pane_pid: str) -> str:
+    """Session UUID for a window, preferring the unambiguous key.
+
+    `pid__<pane_pid>` is exact but dies with the process, so it only helps
+    before a reboot. The `<cwd>__<window>` key is what survives one — at the
+    cost of collapsing two identically named windows in the same directory
+    into one entry.
+    """
+    if pane_pid:
+        uuid = _read(os.path.join(MAP_DIR, f"pid__{pane_pid}"))
+        if uuid:
+            return uuid
+    return _read(os.path.join(MAP_DIR, f"{fs.encode_cwd(cwd)}__{window.replace('/', '-')}"))
+
+
+def last_activity(uuid: str, cwd: str) -> int | None:
+    """Transcript mtime, or None when there is no transcript.
+
+    None means the session is gone for good, so it must leave the index — an
+    entry you cannot resume is worse than no entry, it wastes a restore slot.
+    """
+    direct = os.path.join(PROJECTS_DIR, fs.project_dir(cwd), f"{uuid}.jsonl")
+    if os.path.exists(direct):
+        return int(os.path.getmtime(direct))
+    # The window may have moved since the session started; the UUID is unique,
+    # so a wider search still identifies it.
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", f"{uuid}.jsonl")):
+        return int(os.path.getmtime(path))
+    return None
+
+
+def scan(now: int) -> list[fs.Row]:
+    """Current reading: every live tmux window that has a resumable session."""
+    rows = []
+    for target, window, cwd, pane_pid in tmux_windows():
+        uuid = lookup_uuid(cwd, window, pane_pid)
+        if not uuid:
+            continue
+        activity = last_activity(uuid, cwd)
+        if activity is None:
+            continue
+        rows.append(fs.Row(target, window, cwd, uuid, activity, now))
+    return rows
+
+
+def write_atomic(path: str, content: str) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_index() -> list[fs.Row]:
+    return fs.parse_index(_read(INDEX))
+
+
+def update() -> int:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    now = int(time.time())
+    old = load_index()
+    merged = fs.merge(old, scan(now), now)
+    if not merged and old:
+        # Cannot happen via merge, which retains; a belt-and-braces refusal to
+        # ever trade a populated index for an empty one.
+        return 0
+    write_atomic(INDEX, fs.format_index(merged))
+    write_atomic(HUMAN, fs.render(merged, now))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    arg = argv[1] if len(argv) > 1 else "--update"
+    if arg in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if arg == "--path":
+        print(INDEX)
+        return 0
+    if arg == "--list":
+        sys.stdout.write(fs.format_index(load_index()))
+        return 0
+    if arg == "--render":
+        sys.stdout.write(fs.render(load_index()))
+        return 0
+    if arg == "--update":
+        return update()
+    sys.stderr.write(f"flow-session-index: unknown option {arg!r}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception as exc:  # never let a cron job fail loudly
+        sys.stderr.write(f"flow-session-index: {exc}\n")
+        sys.exit(1)
