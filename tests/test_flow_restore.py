@@ -27,6 +27,8 @@ def _load():
         "flow_restore", importlib.machinery.SourceFileLoader("flow_restore", _BIN)
     )
     mod = importlib.util.module_from_spec(spec)
+    # @dataclass resolves its module through sys.modules, so register before exec.
+    sys.modules["flow_restore"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -40,16 +42,111 @@ def row(target="main:1", cwd="/home/u/proj", window="claude", activity=100):
     return fs.Row(target, window, cwd, UUID, activity, activity)
 
 
+def pane(pane_id="%1", command="zsh", path="/home/u/proj", active=True,
+         width=100, height=40, target="main:1", pid="1"):
+    return restore.Pane(target, pane_id, pid, command, path, active, width, height)
+
+
+@pytest.fixture(autouse=True)
+def bare_shells(monkeypatch):
+    """By default every pane process looks like an idle shell."""
+    monkeypatch.setattr(restore, "_cmdline", lambda pid: ["/usr/bin/zsh"])
+
+
+# --- is_bare_shell: the check that keeps us out of busy panes ---
+
+def test_plain_shell_is_bare(monkeypatch):
+    monkeypatch.setattr(restore, "_cmdline", lambda pid: ["/usr/bin/zsh"])
+    assert restore.is_bare_shell("1")
+
+
+def test_login_shell_flags_are_still_bare(monkeypatch):
+    monkeypatch.setattr(restore, "_cmdline", lambda pid: ["-zsh", "-l"])
+    assert restore.is_bare_shell("1")
+
+
+def test_shell_running_a_script_is_not_bare(monkeypatch):
+    """The dashboard case: reports `bash`, but is running a program."""
+    monkeypatch.setattr(restore, "_cmdline",
+                        lambda pid: ["/bin/bash", "/usr/local/bin/some-dashboard", "--compact"])
+    assert not restore.is_bare_shell("1")
+
+
+def test_non_shell_process_is_not_bare(monkeypatch):
+    monkeypatch.setattr(restore, "_cmdline", lambda pid: ["/usr/bin/vim"])
+    assert not restore.is_bare_shell("1")
+
+
+def test_unreadable_process_is_not_bare(monkeypatch):
+    """Unknown means unsafe — leave the pane alone rather than guess."""
+    monkeypatch.setattr(restore, "_cmdline", lambda pid: [])
+    assert not restore.is_bare_shell("1")
+
+
+# --- pick_pane ---
+
+def test_focused_shell_wins():
+    chosen = restore.pick_pane([
+        pane(pane_id="%1", active=False, width=200),
+        pane(pane_id="%2", active=True, width=30),
+    ])
+    assert chosen.pane_id == "%2"
+
+
+def test_largest_shell_when_focus_is_elsewhere():
+    """The narrow side column must never win over the working area."""
+    chosen = restore.pick_pane([
+        pane(pane_id="%1", active=False, width=200, height=40),
+        pane(pane_id="%2", active=False, width=30, height=40),
+    ])
+    assert chosen.pane_id == "%1"
+
+
+def test_pane_running_a_program_is_skipped():
+    chosen = restore.pick_pane([
+        pane(pane_id="%1", command="vim", active=True),
+        pane(pane_id="%2", command="zsh", active=False),
+    ])
+    assert chosen.pane_id == "%2"
+
+
+def test_pane_running_a_script_is_skipped(monkeypatch):
+    monkeypatch.setattr(
+        restore, "_cmdline",
+        lambda pid: ["/bin/bash", "/x/dashboard"] if pid == "dash" else ["/usr/bin/zsh"])
+    chosen = restore.pick_pane([
+        pane(pane_id="%1", command="bash", pid="dash", active=True),
+        pane(pane_id="%2", command="zsh", pid="ok", active=False),
+    ])
+    assert chosen.pane_id == "%2"
+
+
+def test_no_usable_pane_returns_none():
+    assert restore.pick_pane([pane(command="vim"), pane(command="claude")]) is None
+
+
 # --- classify ---
 
 def test_window_running_claude_is_live():
-    pairs = restore.classify([row()], {"main:1": ("/home/u/proj", "claude")})
+    assert restore.classify([row()], {"main:1": [pane(command="claude")]})[0][1] == restore.LIVE
+
+
+def test_claude_in_an_unfocused_pane_still_counts_as_live():
+    """Otherwise we would start a second copy of a session already running."""
+    pairs = restore.classify([row()], {"main:1": [
+        pane(pane_id="%1", command="zsh", active=True),
+        pane(pane_id="%2", command="claude", active=False),
+    ]})
     assert pairs[0][1] == restore.LIVE
 
 
 def test_window_at_a_shell_is_restorable():
-    pairs = restore.classify([row()], {"main:1": ("/home/u/proj", "zsh")})
-    assert pairs[0][1] == restore.RESTORABLE
+    assert restore.classify([row()], {"main:1": [pane()]})[0][1] == restore.RESTORABLE
+
+
+def test_window_with_nothing_typeable_is_blocked():
+    pairs = restore.classify([row()], {"main:1": [pane(command="vim")]})
+    assert pairs[0][1] == restore.BLOCKED
 
 
 def test_missing_window_is_gone():
@@ -120,9 +217,22 @@ def test_arm_types_the_command_without_running_it():
                               text=True, timeout=15, **kw)
 
     try:
-        tmux("-f", "/dev/null", "new-session", "-d", "-s", "t", "-n", "agent", "-c", cwd)
+        tmux("-f", "/dev/null", "new-session", "-d", "-s", "t", "-n", "agent", "-c", cwd,
+             "-x", "200", "-y", "50")
         target = tmux("list-windows", "-a", "-F",
                       "#{session_name}:#{window_index}").stdout.strip().splitlines()[0]
+        shell_pane = tmux("list-panes", "-t", target, "-F", "#{pane_id}").stdout.strip()
+
+        # A side column running a script, and focused — the shape that made an
+        # earlier version type its resume command straight into a dashboard.
+        # `read` is a builtin, so pane_current_command stays "bash" throughout,
+        # which is exactly what makes this pane indistinguishable by command name.
+        tmux("split-window", "-h", "-t", target, "-c", cwd,
+             "bash", "--norc", "-c", "read -r _")
+        busy_pane = [p for p in tmux("list-panes", "-t", target, "-F", "#{pane_id}")
+                     .stdout.split() if p != shell_pane][0]
+        assert tmux("display-message", "-p", "-t", target,
+                    "#{pane_id}").stdout.strip() == busy_pane, "busy pane should be focused"
 
         with open(os.path.join(state, "claude-sessions.tsv"), "w") as f:
             f.write(fs.format_index([fs.Row(target, "agent", cwd, UUID, 100, 100)]))
@@ -132,16 +242,22 @@ def test_arm_types_the_command_without_running_it():
                              env=env_run, capture_output=True, text=True, timeout=30)
         assert out.returncode == 0, out.stderr
 
-        pane = ""
+        # -J joins wrapped lines; also drop newlines, since a narrow pane can
+        # split the command mid-token and that is not a failure.
+        def flat(pane_id):
+            return tmux("capture-pane", "-p", "-J", "-t", pane_id).stdout.replace("\n", "")
+
+        content = ""
         for _ in range(20):
-            pane = tmux("capture-pane", "-p", "-t", target).stdout
-            if UUID in pane:
+            content = flat(shell_pane)
+            if UUID in content:
                 break
             time.sleep(0.25)
 
-        assert f"claude --resume {UUID}" in pane, f"command was not typed:\n{pane}"
+        assert f"claude --resume {UUID}" in content, f"command was not typed:\n{content}"
+        assert UUID not in flat(busy_pane), "typed into the pane running a script"
 
-        command = tmux("display-message", "-p", "-t", target,
+        command = tmux("display-message", "-p", "-t", shell_pane,
                        "#{pane_current_command}").stdout.strip()
         assert command != "claude", "--arm must not execute the command"
     finally:

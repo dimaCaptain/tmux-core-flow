@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _LIB = os.path.join(_ROOT, "lib")
@@ -44,61 +45,159 @@ INDEX = os.path.join(STATE_DIR, "claude-sessions.tsv")
 
 LIVE = "live"           # already running Claude — leave alone
 RESTORABLE = "restorable"
+BLOCKED = "blocked"     # window is there, but no pane is safe to type into
 GONE = "gone"           # the window itself is no longer there
 
-_FORMAT = "#{session_name}:#{window_index}\t#{pane_current_path}\t#{pane_current_command}"
+SHELLS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "mksh", "tcsh", "csh"}
+
+_FORMAT = "\t".join((
+    "#{session_name}:#{window_index}",
+    "#{pane_id}",
+    "#{pane_pid}",
+    "#{pane_current_command}",
+    "#{pane_current_path}",
+    "#{?pane_active,1,0}",
+    "#{pane_width}",
+    "#{pane_height}",
+))
+
+
+@dataclass(frozen=True)
+class Pane:
+    target: str
+    pane_id: str
+    pid: str
+    command: str
+    path: str
+    active: bool
+    width: int
+    height: int
 
 
 def tmux(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=10)
 
 
-def live_windows() -> dict[str, tuple[str, str]]:
-    """target -> (cwd, current command) for every window tmux currently has."""
+def _cmdline(pid: str) -> list[str]:
+    """argv of a process, or [] if it cannot be read."""
     try:
-        out = tmux("list-windows", "-a", "-F", _FORMAT)
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return [a for a in f.read().decode("utf-8", "replace").split("\0") if a]
+    except (OSError, ValueError):
+        pass
+    try:  # no /proc (macOS, BSD)
+        out = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip().split() if out.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def is_bare_shell(pid: str) -> bool:
+    """True when this process is an interactive shell and nothing else.
+
+    The reason this check exists: a pane running a long-lived script — a status
+    widget, a watcher, a dashboard column — reports its `pane_current_command`
+    as `bash`, exactly like an idle shell does. Typing a resume command into
+    one of those hijacks it. The process's own argv tells them apart:
+
+        /usr/bin/zsh                          an idle shell — safe
+        /bin/bash /path/to/some-dashboard     a script — never touch
+
+    Anything not recognisable as a bare shell is treated as unsafe, so an
+    unfamiliar setup fails by leaving panes alone rather than by clobbering one.
+    """
+    argv = _cmdline(pid)
+    if not argv:
+        return False
+    name = os.path.basename(argv[0]).lstrip("-")
+    if name not in SHELLS:
+        return False
+    return all(a.startswith("-") for a in argv[1:])  # login/interactive flags only
+
+
+def window_panes() -> dict[str, list[Pane]]:
+    """target -> its panes. Empty when tmux is not running."""
+    try:
+        out = tmux("list-panes", "-a", "-F", _FORMAT)
     except (OSError, subprocess.SubprocessError):
         return {}
     if out.returncode != 0:
         return {}
-    windows = {}
+    windows: dict[str, list[Pane]] = {}
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) == 3:
-            windows[parts[0]] = (parts[1], parts[2])
+        if len(parts) != 8:
+            continue
+        target, pane_id, pid, command, path, active, width, height = parts
+        try:
+            pane = Pane(target, pane_id, pid, command, path, active == "1",
+                        int(width), int(height))
+        except ValueError:
+            continue
+        windows.setdefault(target, []).append(pane)
     return windows
+
+
+def pick_pane(panes: list[Pane]) -> Pane | None:
+    """The pane to type into, or None when the window has no safe one.
+
+    Prefers the pane you left focused — that is where you expect the agent to
+    come back — and falls back to the largest idle shell, which is the main
+    working area rather than a narrow side column.
+    """
+    usable = [p for p in panes if p.command in SHELLS and is_bare_shell(p.pid)]
+    if not usable:
+        return None
+    usable.sort(key=lambda p: (not p.active, -(p.width * p.height), p.pane_id))
+    return usable[0]
 
 
 def transcript_exists(uuid: str, cwd: str) -> bool:
     return os.path.exists(os.path.join(PROJECTS_DIR, fs.project_dir(cwd), f"{uuid}.jsonl"))
 
 
-def classify(rows: list[fs.Row], windows: dict[str, tuple[str, str]]) -> list[tuple[fs.Row, str]]:
-    """Pair each indexed session with what is currently true of its window."""
+def classify(rows: list[fs.Row], windows: dict[str, list[Pane]]) -> list[tuple[fs.Row, str]]:
+    """Pair each indexed session with what is currently true of its window.
+
+    Claude is looked for in *every* pane, not just the focused one: an agent
+    running in a background pane is still running, and offering to resume it
+    would start a second copy of the same session.
+    """
     out = []
     for row in rows:
-        if row.target not in windows:
+        panes = windows.get(row.target)
+        if not panes:
             out.append((row, GONE))
-            continue
-        _, command = windows[row.target]
-        out.append((row, LIVE if command == "claude" else RESTORABLE))
+        elif any(p.command == "claude" for p in panes):
+            out.append((row, LIVE))
+        elif pick_pane(panes) is None:
+            out.append((row, BLOCKED))
+        else:
+            out.append((row, RESTORABLE))
     return out
 
 
-def resume_command(row: fs.Row, window_cwd: str) -> str:
-    """The command to type. Includes a `cd` when the window drifted elsewhere,
+def resume_command(row: fs.Row, pane_cwd: str) -> str:
+    """The command to type. Includes a `cd` when the pane sits elsewhere,
     because `--resume` only finds a session from its own project directory."""
     resume = f"claude --resume {row.uuid}"
-    if window_cwd != row.cwd:
+    if pane_cwd != row.cwd:
         return f"cd {shlex.quote(row.cwd)} && {resume}"
     return resume
 
 
-def send(target: str, command: str, execute: bool) -> None:
-    tmux("send-keys", "-t", target, "C-u")  # clear whatever is on the prompt
-    tmux("send-keys", "-t", target, "-l", command)
+def send(pane_id: str, command: str, execute: bool) -> None:
+    """Type into one specific pane.
+
+    Addressed by pane id (`%14`), never by window: `send-keys -t session:window`
+    goes to whichever pane happens to be focused, which after a restore is
+    routinely the wrong one.
+    """
+    tmux("send-keys", "-t", pane_id, "C-u")  # clear whatever is on the prompt
+    tmux("send-keys", "-t", pane_id, "-l", command)
     if execute:
-        tmux("send-keys", "-t", target, "Enter")
+        tmux("send-keys", "-t", pane_id, "Enter")
 
 
 def select(pairs, targets: list[str], want_all: bool) -> list[tuple[fs.Row, str]]:
@@ -149,7 +248,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     rows = [r for r in rows if transcript_exists(r.uuid, r.cwd)]
-    windows = live_windows()
+    windows = window_panes()
     pairs = classify(rows, windows)
     now = int(time.time())
 
@@ -165,18 +264,25 @@ def main(argv: list[str]) -> int:
     if mode == "plan":
         restorable = [p for p in pairs if p[1] == RESTORABLE]
         live = [p for p in pairs if p[1] == LIVE]
+        blocked = [p for p in pairs if p[1] == BLOCKED]
         if not restorable:
             print(f"Nothing to restore ({len(live)} window(s) already running Claude).")
-            return 0
-        print(f"{len(restorable)} session(s) can be restored:\n")
-        for row, _ in sorted(restorable, key=lambda p: (-p[0].activity, p[0].target)):
-            cwd_now = windows[row.target][0]
-            age = fs.humanize(now - row.activity)
-            print(f"  {row.target:<16} {row.window:<12} {age:>4} ago   "
-                  f"{resume_command(row, cwd_now)}")
+        else:
+            print(f"{len(restorable)} session(s) can be restored:\n")
+            for row, _ in sorted(restorable, key=lambda p: (-p[0].activity, p[0].target)):
+                pane = pick_pane(windows[row.target])
+                age = fs.humanize(now - row.activity)
+                print(f"  {row.target:<16} {row.window:<12} {age:>4} ago   "
+                      f"{resume_command(row, pane.path)}")
         if live:
             print(f"\n{len(live)} window(s) already running Claude, left alone.")
-        print("\n--arm to type these in, --run to start them, --all for every window.")
+        if blocked:
+            print(f"\n{len(blocked)} window(s) have no idle shell pane to type into:")
+            for row, _ in blocked:
+                print(f"  {row.target:<16} {row.window}")
+            print("  (every pane is running something — close one or open a split)")
+        if restorable:
+            print("\n--arm to type these in, --run to start them, --all for every window.")
         return 0
 
     if not chosen:
@@ -190,7 +296,8 @@ def main(argv: list[str]) -> int:
 
     if mode == "arm":
         for row, _ in chosen:
-            send(row.target, resume_command(row, windows[row.target][0]), execute=False)
+            pane = pick_pane(windows[row.target])
+            send(pane.pane_id, resume_command(row, pane.path), execute=False)
         print(f"Typed the resume command into {len(chosen)} window(s). "
               "Press Enter in the ones you want.")
         return 0
@@ -199,8 +306,9 @@ def main(argv: list[str]) -> int:
     for start in range(0, len(chosen), batch):
         group = chosen[start:start + batch]
         for row, _ in group:
-            send(row.target, resume_command(row, windows[row.target][0]), execute=True)
-            print(f"  started {row.target} ({row.window})")
+            pane = pick_pane(windows[row.target])
+            send(pane.pane_id, resume_command(row, pane.path), execute=True)
+            print(f"  started {row.target} ({row.window}) in pane {pane.pane_id}")
         if start + batch < len(chosen):
             time.sleep(pause)
     print(f"Started {len(chosen)} session(s).")

@@ -120,7 +120,20 @@ open. Nothing starts on its own — resuming twenty agents simultaneously will
 put the machine into swap, which is why restoring is a choice here and not a
 boot-time side effect. `--run` batches for the same reason.
 
-A window already running Claude is never touched.
+Two things it will not do. A window where Claude runs in **any** pane is left
+alone, so you never get a second copy of a live session. And within a window it
+types into a specific pane — the one you left focused, or the largest idle
+shell — chosen by checking that the pane's process really is a bare shell:
+
+```
+/usr/bin/zsh                       idle shell — safe to type into
+/bin/bash /path/to/some-widget     a script — skipped
+```
+
+That check matters because a pane running a long-lived script reports its
+`pane_current_command` as `bash`, exactly like an idle shell. Without looking at
+the actual argv, a resume command lands in your status widget instead of your
+shell. A window with no idle pane is reported as blocked rather than guessed at.
 
 ## Install
 
