@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# claude-hook-notify — tmux window coloring based on Claude Code hook events.
+#
+# Reads JSON from stdin (Claude Code hook protocol).
+# Finds the tmux window by walking the process tree (PPID chain).
+#
+# Colors:
+#   🟡 yellow — working (activity detected)
+#   🟢 green  — permission_prompt (needs user approval)
+#   🔴 red    — stop (agent finished work)
+#
+# Red is sticky against ambient activity. Only green (permission_prompt) or
+# a new user prompt (UserPromptSubmit) clears it back to yellow.
+# Green (waiting for approval) is cleared by PostToolUse — a tool ran, so the
+# agent resumed working after your approval.
+
+set -euo pipefail
+
+input=$(cat)
+
+notification_type=$(echo "$input" | jq -r '.notification_type // empty' 2>/dev/null || true)
+hook_event_name=$(echo "$input" | jq -r '.hook_event_name // empty' 2>/dev/null || true)
+
+# --- Config ---
+YELLOW="bg=#f9e2af,fg=#1e1e2e"
+GREEN="bg=#a6e3a1,fg=#1e1e2e,bold"
+RED="bg=#f38ba8,fg=#1e1e2e,bold"
+
+# --- Find tmux window by walking PPID chain ---
+# Hook runs as child of claude, which runs in a tmux pane.
+# We walk up the process tree to find the pane PID, then match it to a window.
+find_tmux_window() {
+  local ppid="$PPID"
+  local max_depth=10
+
+  while [ "$ppid" -gt 1 ] && [ "$max_depth" -gt 0 ]; do
+    max_depth=$((max_depth - 1))
+
+    # Check if this PID matches any tmux pane
+    local match
+    match=$(tmux list-panes -a -F "#{session_name}|#{window_index}|#{pane_pid}" 2>/dev/null \
+      | grep "|${ppid}$" | head -1)
+
+    if [ -n "$match" ]; then
+      echo "$match"
+      return 0
+    fi
+
+    # Walk up to parent
+    local stat
+    stat=$(cat /proc/"$ppid"/stat 2>/dev/null || echo "")
+    if [ -z "$stat" ]; then
+      break
+    fi
+    # PPID is 4th field in /proc/pid/stat (format: pid (comm) state ppid ...)
+    local rpar="${stat##*)}"
+    ppid=$(echo "$rpar" | awk '{print $2}')
+  done
+
+  return 1
+}
+
+# --- Set window color ---
+set_tab_color() {
+  local session="$1" win="$2" style="$3"
+  tmux set-window-option -t "${session}:${win}" window-status-style "$style" 2>/dev/null || true
+}
+
+# --- Get current color ---
+get_tab_color() {
+  local session="$1" win="$2"
+  tmux show-window-option -t "${session}:${win}" window-status-style 2>/dev/null | awk '{print $2}'
+}
+
+# --- tab-state: timestamps по фазе, читает дашборд для elapsed ---
+# Файл ~/.tmux/tab-state/<sess>__<win>.txt, формат key=value построчно:
+#   work     — старт работы над промптом (UserPromptSubmit)
+#   wait     — начало ожидания аппрува (permission_prompt)
+#   done     — момент завершения работы (Stop)
+#   activity — последняя активность (PostToolUse / прочие notification)
+state_file=""
+state_upsert() {
+  local key="$1" val="$2"
+  [ -z "$state_file" ] && return
+  if grep -q "^${key}=" "$state_file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$state_file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$state_file"
+  fi
+}
+
+# --- Main ---
+win_info=$(find_tmux_window) || win_info=""
+
+if [ -z "$win_info" ]; then
+  exit 0
+fi
+
+session=$(echo "$win_info" | cut -d'|' -f1)
+win=$(echo "$win_info" | cut -d'|' -f2)
+
+if [ -z "$session" ] || [ -z "$win" ]; then
+  exit 0
+fi
+
+# Путь к tab-state (тот же ключ что в дашборде: <sess>__<win>.txt).
+state_dir="$HOME/.tmux/tab-state"
+mkdir -p "$state_dir"
+state_sess_key=$(echo "$session" | tr ' /' '__')
+state_file="${state_dir}/${state_sess_key}__${win}.txt"
+now=$(date +%s)
+
+# --- claude-map: (cwd + window) → session_id ---
+# Даёт дашборду UUID для jsonl-fallback модели (для claude без явного --model).
+session_id=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null || true)
+cwd=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null || true)
+if [ -n "$session_id" ] && [ -n "$cwd" ]; then
+  win_name=$(tmux display-message -t "${session}:${win}" -p "#{window_name}" 2>/dev/null || echo "?")
+  cwd_key=$(echo "$cwd" | tr '/_' '--' | sed 's/^-//')
+  name_key=$(echo "$win_name" | tr '/' '-')
+  map_dir="$HOME/.tmux/claude-map"
+  mkdir -p "$map_dir"
+  printf '%s' "$session_id" > "$map_dir/${cwd_key}__${name_key}"
+  pane_pid=$(tmux display-message -t "${session}:${win}" -p "#{pane_pid}" 2>/dev/null || true)
+  [ -n "$pane_pid" ] && printf '%s' "$session_id" > "$map_dir/pid__${pane_pid}"
+fi
+
+current_color=$(get_tab_color "$session" "$win")
+
+if [ "$notification_type" = "permission_prompt" ]; then
+  # 🟢 Always show green for permission prompts
+  set_tab_color "$session" "$win" "$GREEN"
+  state_upsert wait "$now"
+
+elif [ "$hook_event_name" = "Stop" ]; then
+  # 🔴 Agent finished work
+  set_tab_color "$session" "$win" "$RED"
+  state_upsert done "$now"
+
+elif [ "$hook_event_name" = "UserPromptSubmit" ]; then
+  # 🟡 New task from user → clear sticky red, agent is working again.
+  # Fires only on real user input, so spurious activity never flips red.
+  set_tab_color "$session" "$win" "$YELLOW"
+  state_upsert work "$now"
+  state_upsert activity "$now"
+
+elif [ "$hook_event_name" = "PostToolUse" ]; then
+  # 🟡 Tool ran (e.g. right after you approved) → agent resumed: clear green → yellow.
+  # work НЕ трогаем: это продолжение того же промпта, elapsed считает с его старта.
+  if [[ "$current_color" == *a6e3a1* ]]; then
+    set_tab_color "$session" "$win" "$YELLOW"
+  fi
+  state_upsert activity "$now"
+
+else
+  # 🟡 Working (other notifications). Don't override red (sticky) or green.
+  if [[ "$current_color" != *f38ba8* ]] && [[ "$current_color" != *a6e3a1* ]]; then
+    set_tab_color "$session" "$win" "$YELLOW"
+  fi
+  state_upsert activity "$now"
+fi
+
+exit 0

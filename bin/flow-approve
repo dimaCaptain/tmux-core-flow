@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook → deterministic autoapprove.
 
-Reads the tool call as JSON on stdin and decides, from `config/policy.yaml`,
-whether to auto-approve it. Replaces the old tmux screen-scraper: no terminal
-parsing, no key injection, no timing races — the decision is made from the
-exact `tool_name` + `tool_input` before any prompt is shown.
+Reads the tool call as JSON on stdin and decides, from a policy file, whether to
+auto-approve it. No terminal parsing, no key injection, no timing races — the
+decision is made from the exact `tool_name` + `tool_input` before any prompt is
+shown. See `policy_path` for where the rules are read from.
 
 Scoping safeguard
 -----------------
@@ -21,6 +21,9 @@ Contract
             "permissionDecision": "allow"|"ask", "permissionDecisionReason": "..."}}
            or nothing at all (transparent → default prompt behaviour).
 - Always exits 0. Any error → emit nothing, so a bug here can never block agents.
+
+Wired up by install.sh as ~/.local/bin/flow-approve, registered in
+~/.claude/settings.json under hooks.PreToolUse.
 """
 from __future__ import annotations
 
@@ -28,15 +31,35 @@ import json
 import os
 import sys
 
-# Make `core` importable whether run directly or via a ~/.local/bin symlink
-# (the symlink resolves to this file inside the repo).
+# Resolve the repo root whether run directly or via the ~/.local/bin symlink
+# (realpath follows the symlink back to bin/ inside the repo).
 _ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_LIB = os.path.join(_ROOT, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
 
-from core import policy  # noqa: E402
+import flow_policy as policy  # noqa: E402
 
-DEFAULT_POLICY = os.path.join(_ROOT, "config", "policy.yaml")
+USER_POLICY = os.path.expanduser("~/.config/tmux-core-flow/policy.yaml")
+EXAMPLE_POLICY = os.path.join(_ROOT, "config", "policy.example.yaml")
+
+
+def policy_path(env) -> str:
+    """Where to read rules from, most specific first.
+
+    1. $FLOW_POLICY            — explicit override (used by the tests)
+    2. ~/.config/tmux-core-flow/policy.yaml — your rules; keep them out of git
+    3. config/policy.example.yaml           — the shipped starting point
+
+    Keeping your real deny-list outside the repo is what lets this repo be
+    public while your rules stay yours.
+    """
+    override = env.get("FLOW_POLICY")
+    if override:
+        return override
+    if os.path.exists(USER_POLICY):
+        return USER_POLICY
+    return EXAMPLE_POLICY
 
 
 def evaluate(event: dict, rules: dict, enabled: bool) -> dict | None:
@@ -85,7 +108,7 @@ def main() -> int:
     except Exception:
         return 0  # malformed input → transparent, never block the agent
     try:
-        rules = policy.load(os.environ.get("FLOW_POLICY", DEFAULT_POLICY))
+        rules = policy.load(policy_path(os.environ))
     except Exception:
         rules = {"always_ask": []}
     try:

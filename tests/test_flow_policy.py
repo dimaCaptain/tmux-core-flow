@@ -1,10 +1,14 @@
-"""Tests for the autoapprove policy engine (deny-list matching)."""
+"""Tests for the autoapprove policy engine (deny-list matching).
+
+Engine lives in lib/flow_policy.py; the rules it reads are config/policy.yaml.
+"""
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "lib"))
 
-from core import policy  # noqa: E402
+import flow_policy as policy  # noqa: E402
 
 # Policy mirroring config/policy.yaml
 RULES = {
@@ -86,11 +90,7 @@ def test_empty_policy_allows_everything():
 # --- loader reads the real YAML ---
 
 def test_load_real_policy_file():
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "config", "policy.yaml",
-    )
-    rules = policy.load(path)
+    rules = policy.load(os.path.join(_ROOT, "config", "policy.example.yaml"))
     assert "Bash(!rm " in rules["always_ask"]
     assert policy.decide("Bash", {"command": "rm -rf x"}, rules) == "ask"
     assert policy.decide("Bash", {"command": "echo hi"}, rules) == "allow"
