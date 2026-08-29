@@ -1,0 +1,56 @@
+# Off-machine copy of the session state — see docs/sync.md.
+#
+# Copy to ~/.config/tmux-core-flow/sync.yaml and set `repo`. Everything else
+# has a working default; the keys are here so you can see what travels.
+
+# Where the snapshots live. Any restic backend works; sftp needs nothing on the
+# server but the ssh daemon that is already there.
+#
+#   sftp:myserver:/srv/flow-state     ssh host from ~/.ssh/config
+#   /mnt/backup/flow-state            an external disk
+#   s3:s3.amazonaws.com/bucket        object storage
+repo: sftp:CHANGEME:/srv/flow-state
+
+# The only key to the repository. Keep a copy off this machine — losing it
+# loses every snapshot, and that is the point of encryption at rest.
+password_file: ~/.config/tmux-core-flow/sync-password
+
+# The transcripts. This is the context itself; everything else is a pointer.
+projects: ~/.claude/projects
+
+# The durable index — merged on pull, never overwritten.
+index: ~/.tmux/claude-sessions.tsv
+
+# Per-project trust, allowed tools and MCP servers. Only the `projects` section
+# is imported on a pull; the rest of this file describes one installation.
+claude_json: ~/.claude.json
+
+# Copied back file by file, with path-encoded names rewritten when $HOME moved.
+extra:
+  - ~/.tmux/claude-map
+  - ~/.tmux/claude-launcher
+  - ~/.tmux/tab-state
+  # tmux-resurrect saves the window layout itself. Both paths are listed
+  # because the plugin moved to XDG; a path that is absent is skipped.
+  - ~/.tmux/resurrect
+  - ~/.local/share/tmux/resurrect
+
+# Never leaves the machine: the credentials are the account, not the context.
+excludes:
+  - "**/.credentials.json"
+  - "**/__pycache__"
+  - "*.tmp"
+  - "*.tmp.*"
+
+# Transcripts only ever grow, so history costs the delta. What it buys is the
+# one accident a mirror cannot survive — a local `rm -rf ~/.claude`.
+retention:
+  - "--keep-daily"
+  - "7"
+  - "--keep-weekly"
+  - "4"
+  - "--keep-monthly"
+  - "6"
+
+# Snapshot tag. Change it only to keep two unrelated machines in one repo.
+tag: flow-state

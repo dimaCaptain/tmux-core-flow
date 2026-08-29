@@ -6,8 +6,9 @@
 #   ./install.sh --dry-run   preview, change nothing
 #
 # Creates:
-#   ~/.local/bin/{flow-approve,claude-hook-notify,flow-session-index,flow-restore}
+#   ~/.local/bin/{flow-approve,claude-hook-notify,flow-session-index,flow-restore,flow-sync}
 #   ~/.config/tmux-core-flow/policy.yaml            -> copy of the example, yours to edit
+#   ~/.config/tmux-core-flow/sync.yaml              -> only if you want off-machine copies
 #   ~/.claude/settings.json                          -> hooks registered
 #
 # It never edits your ~/.tmux.conf or your crontab: both lines are printed at
@@ -29,7 +30,7 @@ run() { if [ "$DRY" = 1 ]; then say "  [dry-run] $*"; else eval "$*"; fi; }
 say "tmux-core-flow install (repo: $ROOT)$([ "$DRY" = 1 ] && echo ' [DRY-RUN]')"
 
 # ---------------------------------------------------------------------------
-say "[1/4] dependencies"
+say "[1/5] dependencies"
 missing=""
 for c in tmux jq python3; do command -v "$c" >/dev/null || missing="$missing $c"; done
 python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml(PyYAML)"
@@ -39,11 +40,14 @@ if [ -n "$missing" ]; then
 else
   say "  ok   tmux, jq, python3, PyYAML"
 fi
+command -v restic >/dev/null \
+  && say "  ok   restic (flow-sync can push off-machine)" \
+  || say "  --   restic absent — everything works, flow-sync does not"
 
 # ---------------------------------------------------------------------------
-say "[2/4] PATH symlinks in $LOCAL_BIN"
+say "[2/5] PATH symlinks in $LOCAL_BIN"
 [ "$DRY" = 1 ] || mkdir -p "$LOCAL_BIN"
-for name in flow-approve claude-hook-notify flow-session-index flow-restore; do
+for name in flow-approve claude-hook-notify flow-session-index flow-restore flow-sync; do
   tgt="$ROOT/bin/$name"
   lp="$LOCAL_BIN/$name"
   [ "$DRY" = 1 ] || chmod +x "$tgt"
@@ -59,7 +63,7 @@ done
 # ---------------------------------------------------------------------------
 # Your rules live outside the repo, so this checkout stays publishable and
 # `git pull` never fights your edits.
-say "[3/4] policy in $CFG_DIR"
+say "[3/5] policy in $CFG_DIR"
 if [ -f "$CFG_DIR/policy.yaml" ]; then
   say "  keep policy.yaml (yours — the example is never copied over it)"
 else
@@ -69,7 +73,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-say "[4/4] hooks in $SETTINGS"
+# Deliberately not created from the example: the example has no repository in
+# it, and a config that points nowhere is worse than none — it turns a missing
+# setup into a runtime failure. See docs/sync.md.
+say "[4/5] off-machine copies (optional)"
+if [ -f "$CFG_DIR/sync.yaml" ]; then
+  say "  keep sync.yaml (yours)"
+else
+  say "  none — \`cp $ROOT/config/sync.example.yaml $CFG_DIR/sync.yaml\` and set repo:"
+fi
+
+# ---------------------------------------------------------------------------
+say "[5/5] hooks in $SETTINGS"
 if [ "$DRY" = 1 ]; then
   say "  [dry-run] would register PreToolUse -> flow-approve"
   say "  [dry-run] would register Notification/UserPromptSubmit/Stop/PostToolUse -> claude-hook-notify"
@@ -132,6 +147,13 @@ else
   say "       */15 * * * * $LOCAL_BIN/flow-session-index --update"
   say ""
   say "   Without it the index still works, but only reflects the last refresh."
+fi
+if [ -f "$CFG_DIR/sync.yaml" ] && ! crontab -l 2>/dev/null | grep -q 'flow-sync'; then
+  say ""
+  say "3. Off-machine copies are configured but nothing pushes them — add:"
+  say ""
+  say "       */15 * * * * $LOCAL_BIN/flow-sync push --if-stale 900 --quiet"
+  say "       17 4 * * 0   $LOCAL_BIN/flow-sync forget >/dev/null"
 fi
 say ""
 say "Autoapprove is then active in every tmux window; dangerous calls still"

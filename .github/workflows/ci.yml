@@ -20,5 +20,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      # tmux and restic are what the two end-to-end tests need: one drives a
+      # throwaway tmux server to prove --arm types without executing, the other
+      # pushes a throwaway $HOME into a real repository and pulls it into a
+      # different one. Both skip when absent, which is the same as not running.
+      - name: Install tmux and restic
+        run: sudo apt-get update && sudo apt-get install -y tmux restic
       - name: Run tests
         run: pytest -q

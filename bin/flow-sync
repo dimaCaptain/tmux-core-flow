@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""Keep the session state off this machine, and bring it back.
+
+Everything `flow-restore` needs is on disk, which is exactly why a dead disk
+takes it all. This pushes that state — transcripts, the index, the pane map —
+into an encrypted restic repository over ssh, and pulls it back onto a machine
+that has nothing.
+
+    flow-sync init                 create the repository (once)
+    flow-sync push                 snapshot the current state
+    flow-sync pull                 bring the newest snapshot back
+    flow-sync status               repo, last push, what would go
+    flow-sync snapshots            what is in the repository
+    flow-sync forget               apply the retention policy, reclaim space
+
+Options:
+    --dry-run          say what would happen, change nothing
+    --if-stale S       push only if the last one was over S seconds ago (cron)
+    --detach           push in the background, return immediately (hooks)
+    --quiet            only errors
+    --snapshot ID      pull that snapshot instead of the latest
+    --remap A=B        rewrite path prefix A to B while restoring
+    --no-remap         restore paths verbatim, even onto a different $HOME
+    --force            let the snapshot overwrite local files
+    --keep-staging     leave the restored tree for inspection
+
+A pull never destroys: it copies in what is missing, keeps what is already
+ahead, and parks a genuine conflict as `<file>.from-sync`. See lib/flow_sync.py
+for why each of those is the rule.
+
+Config: ~/.config/tmux-core-flow/sync.yaml (or $FLOW_SYNC_CONFIG).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_LIB = os.path.join(_ROOT, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+import flow_sessions as fs  # noqa: E402
+import flow_sync as sync  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("FLOW_SYNC_CONFIG") or os.path.join(
+    HOME, ".config", "tmux-core-flow", "sync.yaml")
+CACHE = os.path.join(HOME, ".cache", "tmux-core-flow")
+STAMP = os.path.join(CACHE, "last-push")
+LOG = os.path.join(CACHE, "sync.log")
+STAGING = os.path.join(CACHE, "staging")
+
+
+# --- plumbing --------------------------------------------------------------
+
+
+def load() -> sync.Config:
+    data = None
+    if os.path.exists(CONFIG):
+        try:
+            import yaml
+        except ImportError:
+            die(f"{CONFIG} exists but PyYAML is not installed")
+        with open(CONFIG) as f:
+            data = yaml.safe_load(f) or {}
+    cfg = sync.load_config(data, os.environ, HOME)
+    if not cfg.repo:
+        die(f"no repository configured — set `repo:` in {CONFIG} "
+            "or $FLOW_SYNC_REPO (see config/sync.example.yaml)")
+    return cfg
+
+
+def die(msg: str, code: int = 2) -> None:
+    sys.stderr.write(f"flow-sync: {msg}\n")
+    sys.exit(code)
+
+
+def restic(cfg: sync.Config, argv: list[str], capture: bool = False,
+           check: bool = True) -> subprocess.CompletedProcess:
+    if not os.path.exists(cfg.password_file):
+        die(f"no password file at {cfg.password_file}\n"
+            "  create one:  install -m600 /dev/null FILE && head -c32 /dev/urandom "
+            "| base64 > FILE\n"
+            "  then keep a copy somewhere off this machine — without it the "
+            "repository is unreadable")
+    if shutil.which("restic") is None:
+        die("restic is not installed (apt install restic)")
+    proc = subprocess.run(
+        argv, env=sync.env_for(cfg, os.environ),
+        capture_output=capture, text=True,
+    )
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or "").strip() if capture else ""
+        die(f"restic failed ({' '.join(argv[3:5])}): {detail or proc.returncode}", 1)
+    return proc
+
+
+def existing(paths) -> list[str]:
+    return [p for p in paths if p and os.path.exists(p)]
+
+
+def read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def write_atomic(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def stat_of(path: str) -> sync.Stat | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return sync.Stat(st.st_size, int(st.st_mtime))
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}G"
+
+
+def tree_size(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+# --- push ------------------------------------------------------------------
+
+
+def cmd_push(cfg: sync.Config, args: dict) -> int:
+    if args["if_stale"] is not None:
+        last = None
+        stamp = read(STAMP).strip()
+        if stamp.isdigit():
+            last = int(stamp)
+        if not sync.is_stale(last, int(time.time()), args["if_stale"]):
+            return 0
+
+    if args["detach"]:
+        # A hook must return now, not when the network does. The child keeps no
+        # handle on the caller's terminal, so a slow push cannot hold up a pane.
+        os.makedirs(CACHE, exist_ok=True)
+        argv = [sys.executable, os.path.realpath(__file__), "push", "--quiet"]
+        if args["if_stale"] is not None:
+            argv += ["--if-stale", str(args["if_stale"])]
+        with open(LOG, "a") as log:
+            subprocess.Popen(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        return 0
+
+    paths = existing(cfg.paths)
+    if not paths:
+        die("nothing to push — none of the configured paths exist")
+
+    # A cron entry and a Stop hook can both come due in the same second, and
+    # the second one would meet a locked repository and report a failure that
+    # is not one. Losing the race is the correct outcome: the work is already
+    # being done, by a process reading the same files.
+    os.makedirs(CACHE, exist_ok=True)
+    lock = open(os.path.join(CACHE, "push.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not args["quiet"]:
+            print("another push is running — nothing to do")
+        return 0
+
+    argv = sync.backup_argv(cfg, paths, dry_run=args["dry_run"])
+    if args["quiet"] and not args["dry_run"]:
+        argv.insert(3, "--quiet")
+    proc = restic(cfg, argv, capture=args["quiet"], check=False)
+    if proc.returncode not in (0, 3):  # 3: some files could not be read
+        detail = (proc.stderr or "").strip() if args["quiet"] else ""
+        die(f"restic backup failed: {detail or proc.returncode}", 1)
+    if proc.returncode == 3 and not args["quiet"]:
+        print("(some files were unreadable and were skipped)")
+
+    if not args["dry_run"]:
+        write_atomic(STAMP, str(int(time.time())) + "\n")
+    return 0
+
+
+# --- pull ------------------------------------------------------------------
+
+
+def snapshot_home(cfg: sync.Config, snapshot: str) -> str:
+    """The `$HOME` the snapshot was taken under, read from its own paths.
+
+    Derived from the transcript store rather than guessed from usernames: that
+    path is the one the restore has to line up with, so if it is not in the
+    snapshot there is nothing to remap anyway. The suffix comes from the local
+    config, so a non-default `projects:` is recognised in the snapshot too.
+    """
+    suffix = os.path.relpath(cfg.projects, cfg.home)
+    proc = restic(cfg, sync.snapshots_argv(cfg), capture=True)
+    try:
+        snaps = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return ""
+    if snapshot != "latest":
+        snaps = [s for s in snaps if s.get("short_id") == snapshot or s.get("id") == snapshot]
+    if not snaps:
+        return ""
+    for path in snaps[-1].get("paths", []):
+        if path.endswith("/" + suffix):
+            return path[: -len(suffix) - 1]
+    return ""
+
+
+def reconcile_file(src: str, dst: str, args: dict, tally: dict) -> None:
+    decision = sync.decide(stat_of(dst), stat_of(src), force=args["force"])
+    if decision == sync.KEEP:
+        tally["kept"] += 1
+        return
+    target = dst if decision == sync.COPY else sync.sidecar_path(dst)
+    tally["copied" if decision == sync.COPY else "conflicts"] += 1
+    if decision == sync.SIDECAR:
+        tally["conflict_paths"].append(dst)
+    if args["dry_run"]:
+        return
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(src, target)
+
+
+def reconcile_root(src_root: str, dst_root: str, mapping, args: dict, tally: dict) -> None:
+    """Copy one state directory back, renaming its top-level entries.
+
+    Only the entries directly under the root carry an encoded path in their
+    name — a project directory, a `claude-map` key — so that is the one level
+    where a rename applies. Everything below is a plain file name.
+    """
+    if not os.path.isdir(src_root):
+        if os.path.isfile(src_root):
+            reconcile_file(src_root, dst_root, args, tally)
+        return
+    for entry in sorted(os.listdir(src_root)):
+        src = os.path.join(src_root, entry)
+        dst = os.path.join(dst_root, sync.remap_dirname(entry, mapping))
+        if os.path.isdir(src):
+            for root, _dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                for name in sorted(files):
+                    reconcile_file(os.path.join(root, name),
+                                   os.path.normpath(os.path.join(dst, rel, name)),
+                                   args, tally)
+        elif os.path.isfile(src):
+            reconcile_file(src, dst, args, tally)
+
+
+def cmd_pull(cfg: sync.Config, args: dict) -> int:
+    staging = args["staging"] or STAGING
+    snapshot = args["snapshot"]
+
+    src_home = snapshot_home(cfg, snapshot)
+    if not src_home:
+        die("no snapshot with a transcript store found in the repository")
+
+    mapping = tuple(args["remap"])
+    if not mapping and not args["no_remap"]:
+        mapping = sync.detect_remap(src_home, cfg.home)
+    if mapping:
+        print("remapping paths: " + ", ".join(f"{a} -> {b}" for a, b in mapping))
+
+    # The default staging area is ours to recycle. Anything else was named by
+    # the caller, and emptying a directory somebody pointed at is not a thing
+    # this gets to do quietly.
+    if os.path.exists(staging):
+        if os.path.realpath(staging).startswith(os.path.realpath(CACHE) + os.sep):
+            shutil.rmtree(staging)
+        elif os.listdir(staging):
+            die(f"--staging {staging} is not empty — point it at a new directory")
+    os.makedirs(staging, exist_ok=True)
+    print(f"restoring snapshot {snapshot} into {staging} …")
+    restic(cfg, sync.restore_argv(cfg, snapshot, staging), capture=True)
+
+    def staged(path: str) -> str:
+        return os.path.join(staging, path.lstrip("/"))
+
+    tally = {"copied": 0, "kept": 0, "conflicts": 0, "conflict_paths": []}
+    src_projects = staged(cfg.projects.replace(cfg.home, src_home, 1))
+    reconcile_root(src_projects, cfg.projects, mapping, args, tally)
+
+    for path in cfg.extra:
+        reconcile_root(staged(path.replace(cfg.home, src_home, 1)), path, mapping, args, tally)
+
+    # The index and the config are the two things that must not be copied over:
+    # both describe this machine as well as the snapshot's, so both merge.
+    index_added = 0
+    src_index = staged(cfg.index.replace(cfg.home, src_home, 1))
+    if os.path.exists(src_index):
+        now = int(time.time())
+        before = len(fs.parse_index(read(cfg.index)))
+        merged = sync.merge_index(read(cfg.index), read(src_index), now, mapping)
+        index_added = len(fs.parse_index(merged)) - before
+        if not args["dry_run"]:
+            write_atomic(cfg.index, merged)
+
+    config_added: list[str] = []
+    src_config = staged(cfg.claude_json.replace(cfg.home, src_home, 1))
+    if os.path.exists(src_config):
+        try:
+            remote = json.loads(read(src_config) or "{}")
+            local = json.loads(read(cfg.claude_json) or "{}")
+        except ValueError:
+            remote, local = {}, {}
+        merged_cfg, config_added = sync.merge_claude_json(local, remote, mapping)
+        if config_added and not args["dry_run"]:
+            write_atomic(cfg.claude_json, json.dumps(merged_cfg, indent=2))
+
+    if not args["keep_staging"]:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    prefix = "would restore" if args["dry_run"] else "restored"
+    print(f"\n{prefix}: {tally['copied']} file(s), {tally['kept']} already current")
+    print(f"index: +{index_added} session(s)")
+    if config_added:
+        print(f"claude config: +{len(config_added)} project(s) "
+              f"({', '.join(os.path.basename(p) for p in config_added[:3])}…)")
+    if tally["conflicts"]:
+        print(f"\n{tally['conflicts']} file(s) diverged — the snapshot copy is beside "
+              "the local one as .from-sync:")
+        for path in tally["conflict_paths"][:10]:
+            print(f"  {path}")
+        print("  (that session was resumed on two machines — pick one)")
+    if not args["dry_run"]:
+        print("\nnext: flow-session-index --update && flow-restore")
+    return 0
+
+
+# --- status ----------------------------------------------------------------
+
+
+def cmd_status(cfg: sync.Config, args: dict) -> int:
+    print(f"repo      {cfg.repo}")
+    print(f"password  {cfg.password_file}"
+          f"{'' if os.path.exists(cfg.password_file) else '   MISSING'}")
+    stamp = read(STAMP).strip()
+    if stamp.isdigit():
+        print(f"last push {fs.humanize(int(time.time()) - int(stamp))} ago")
+    else:
+        print("last push never")
+
+    total = 0
+    print("\nwould push:")
+    for path in cfg.paths:
+        if not os.path.exists(path):
+            print(f"  --   {path}   (absent)")
+            continue
+        size = tree_size(path)
+        total += size
+        print(f"  {human_size(size):>6}  {path}")
+    print(f"  {human_size(total):>6}  total")
+
+    proc = restic(cfg, sync.snapshots_argv(cfg, last=True), capture=True, check=False)
+    if proc.returncode != 0:
+        print("\nrepository unreachable or not initialised — flow-sync init")
+        return 1
+    try:
+        snaps = json.loads(proc.stdout or "[]")
+    except ValueError:
+        snaps = []
+    if snaps:
+        s = snaps[-1]
+        print(f"\nlatest snapshot {s.get('short_id')}  {s.get('time', '')[:16]}  "
+              f"from {s.get('hostname', '?')}")
+    else:
+        print("\nrepository is reachable but empty — flow-sync push")
+    return 0
+
+
+def cmd_snapshots(cfg: sync.Config, args: dict) -> int:
+    restic(cfg, sync.base_argv(cfg) + ["snapshots", "--tag", cfg.tag])
+    return 0
+
+
+def cmd_init(cfg: sync.Config, args: dict) -> int:
+    restic(cfg, sync.init_argv(cfg))
+    print(f"\nrepository ready: {cfg.repo}")
+    print(f"back up {cfg.password_file} somewhere else — it is the only key.")
+    return 0
+
+
+def cmd_forget(cfg: sync.Config, args: dict) -> int:
+    restic(cfg, sync.forget_argv(cfg) + (["--dry-run"] if args["dry_run"] else []))
+    return 0
+
+
+COMMANDS = {
+    "init": cmd_init,
+    "push": cmd_push,
+    "pull": cmd_pull,
+    "status": cmd_status,
+    "snapshots": cmd_snapshots,
+    "forget": cmd_forget,
+}
+
+
+def main(argv: list[str]) -> int:
+    args = {
+        "dry_run": False, "force": False, "quiet": False, "detach": False,
+        "no_remap": False, "keep_staging": False, "if_stale": None,
+        "snapshot": "latest", "remap": [], "staging": "",
+    }
+    command = ""
+    rest = argv[1:]
+    if "-h" in rest or "--help" in rest or not rest:
+        print(__doc__.strip())
+        return 0
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--dry-run", "--force", "--quiet", "--detach", "--no-remap", "--keep-staging"):
+            args[a.lstrip("-").replace("-", "_")] = True
+        elif a == "--if-stale" and i + 1 < len(rest):
+            i += 1
+            args["if_stale"] = int(rest[i])
+        elif a == "--snapshot" and i + 1 < len(rest):
+            i += 1
+            args["snapshot"] = rest[i]
+        elif a == "--staging" and i + 1 < len(rest):
+            i += 1
+            args["staging"] = rest[i]
+        elif a == "--remap" and i + 1 < len(rest):
+            i += 1
+            try:
+                args["remap"].append(sync.parse_remap(rest[i]))
+            except ValueError as exc:
+                die(str(exc))
+        elif a.startswith("-"):
+            die(f"unknown option {a!r}")
+        elif not command:
+            command = a
+        else:
+            die(f"unexpected argument {a!r}")
+        i += 1
+
+    if command not in COMMANDS:
+        die(f"unknown command {command!r} — one of {', '.join(COMMANDS)}")
+    return COMMANDS[command](load(), args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        sys.stderr.write(f"flow-sync: {exc}\n")
+        sys.exit(1)

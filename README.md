@@ -18,7 +18,8 @@ keypresses, no background daemon.
 2. **Permissions** — `flow-approve` is a `PreToolUse` hook that auto-approves
    tool calls except those matching an `always_ask` deny-list.
 3. **Survival** — `flow-session-index` records which session ran in which
-   window, so a reboot does not cost you the context of a dozen agents.
+   window, so a reboot does not cost you the context of a dozen agents, and
+   `flow-sync` keeps an encrypted copy of that state off the machine entirely.
 
 ## No dashboard here — on purpose
 
@@ -135,6 +136,44 @@ That check matters because a pane running a long-lived script reports its
 the actual argv, a resume command lands in your status widget instead of your
 shell. A window with no idle pane is reported as blocked rather than guessed at.
 
+## Surviving the machine
+
+A reboot is the cheap case — the disk is still there. `flow-sync` covers the
+expensive ones: a reinstall, a second laptop, a stolen one. It pushes the
+transcripts, the index and the pane map into an encrypted
+[restic](https://restic.net) repository over ssh, and pulls them back onto a
+machine that has nothing.
+
+```bash
+flow-sync push            # or from cron: push --if-stale 900 --quiet
+flow-sync pull            # newest snapshot, then flow-restore as usual
+```
+
+The premise was measured, not assumed: `claude --resume` needs the transcript
+and nothing else — a transcript copied into a directory it never belonged to
+resumes with its full history. What it *does* need is the directory name to be
+the slug of the working directory you resume from, which is exactly what breaks
+on a machine where `$HOME` is different. So a pull reads the snapshot's own home,
+compares it with yours, and renames as it restores:
+
+```console
+$ flow-sync pull
+remapping paths: /home/you -> /Users/you
+restored: 166 file(s), 0 already current
+index: +57 session(s)
+```
+
+A pull never destroys. Transcripts only ever grow, so between two copies of one
+session the longer *and* newer one wins and the other is left alone; when
+neither dominates — the session was resumed on two machines — the incoming copy
+is parked as `.from-sync` rather than chosen for you. The index and
+`~/.claude.json` merge instead of being overwritten, because both describe this
+machine as well as the snapshot's. Credentials never leave the machine at all.
+
+Full setup, the conflict rules and the remapping in
+[`docs/sync.md`](docs/sync.md). Needs `restic`; everything else here works
+without it.
+
 ## Install
 
 ```bash
@@ -154,7 +193,8 @@ source-file /path/to/tmux-core-flow/config/tmux-monitoring.conf
 touching it. Your rules are copied to `~/.config/tmux-core-flow/policy.yaml` on
 first run and never overwritten after — so `git pull` never fights your edits.
 
-Requires `tmux`, `jq`, Python **3.10+** and PyYAML.
+Requires `tmux`, `jq`, Python **3.10+** and PyYAML. `flow-sync` also needs
+`restic`; without it everything else is unaffected.
 
 ## Layout
 
@@ -164,14 +204,18 @@ bin/
   flow-approve         PreToolUse entrypoint (stdin JSON -> allow/ask)
   flow-session-index   durable window -> session index (run from cron)
   flow-restore         put sessions back after a reboot
+  flow-sync            push/pull that state off the machine (restic)
 lib/
   flow_policy.py       deny-list decision engine — pure, no I/O
   flow_sessions.py     index merge/render rules — pure, no I/O
+  flow_sync.py         what travels, and how a restore lands — pure, no I/O
 config/
   policy.example.yaml  starting rules; yours live in ~/.config/tmux-core-flow/
+  sync.example.yaml    repository, paths and retention for flow-sync
   tmux-monitoring.conf fragment to source from your own ~/.tmux.conf
 docs/
   state-format.md      the contract: colours, timestamps, session map, index
+  sync.md              off-machine copies: setup, conflicts, path remapping
 ```
 
 ## Development

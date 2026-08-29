@@ -106,7 +106,6 @@ pet-projects:3	claude	/home/you/work/proj	3bcad249-…	1784998162	1784998308
 | `uuid` | the argument to `claude --resume` |
 | `activity` | epoch of the last transcript write |
 | `seen` | epoch this row was last confirmed against a live window |
-
 Two rules make it durable, and both exist because the obvious implementation
 fails at exactly these points:
 
@@ -127,6 +126,15 @@ when everything fancier is broken.
 `flow-restore` consumes the index; `flow-restore --candidates` re-emits it with
 a `live` / `restorable` / `gone` verdict per row if you want to build your own
 picker.
+
+## Off-machine copies
+
+Everything above is a file, which is what makes `flow-sync` a copy job rather
+than an integration: it pushes this state into an encrypted restic repository
+and reconciles it back. The one thing a restore cannot take verbatim is a name
+— the transcript directory and the `claude-map` keys encode an absolute path,
+so a machine with a different `$HOME` gets them rewritten by prefix, along with
+the `cwd` column of the index. See [`sync.md`](sync.md).
 
 ## Stability
 
