@@ -165,9 +165,14 @@ def test_cd_prepended_when_window_drifted():
     assert cmd == f"cd /home/u/proj && claude --resume {UUID}"
 
 
-def test_a_wrapper_that_exists_is_what_gets_typed():
+def test_a_wrapper_that_exists_is_what_gets_typed(monkeypatch):
     """A session started through claude-glm must come back through it, or it
-    resumes the same transcript on a different model."""
+    resumes the same transcript on a different model.
+
+    `which` is stubbed rather than trusted: whether a wrapper happens to be
+    installed is a property of the machine running the suite, not of the
+    behaviour under test."""
+    monkeypatch.setattr(restore.shutil, "which", lambda p: f"/usr/local/bin/{p}")
     cmd = restore.resume_command(row(launcher="claude-glm"), "/home/u/proj")
     assert cmd == f"claude-glm --resume {UUID}"
 
