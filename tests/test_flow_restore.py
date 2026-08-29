@@ -38,8 +38,9 @@ restore = _load()
 UUID = "11111111-2222-3333-4444-555555555555"
 
 
-def row(target="main:1", cwd="/home/u/proj", window="claude", activity=100):
-    return fs.Row(target, window, cwd, UUID, activity, activity)
+def row(target="main:1", cwd="/home/u/proj", window="claude", activity=100,
+        launcher="claude"):
+    return fs.Row(target, window, cwd, UUID, activity, activity, launcher)
 
 
 def pane(pane_id="%1", command="zsh", path="/home/u/proj", active=True,
@@ -162,6 +163,26 @@ def test_no_cd_when_window_is_already_in_place():
 def test_cd_prepended_when_window_drifted():
     cmd = restore.resume_command(row(cwd="/home/u/proj"), "/somewhere/else")
     assert cmd == f"cd /home/u/proj && claude --resume {UUID}"
+
+
+def test_a_wrapper_that_exists_is_what_gets_typed():
+    """A session started through claude-glm must come back through it, or it
+    resumes the same transcript on a different model."""
+    cmd = restore.resume_command(row(launcher="claude-glm"), "/home/u/proj")
+    assert cmd == f"claude-glm --resume {UUID}"
+
+
+def test_a_wrapper_missing_from_this_machine_falls_back(monkeypatch):
+    """Restoring onto a machine without your wrappers must still restore."""
+    monkeypatch.setattr(restore.shutil, "which", lambda p: None)
+    assert restore.resume_command(row(launcher="claude-glm"), "/home/u/proj") == \
+        f"claude --resume {UUID}"
+
+
+def test_the_model_flag_survives_into_the_command(monkeypatch):
+    monkeypatch.setattr(restore.shutil, "which", lambda p: "/usr/bin/claude")
+    cmd = restore.resume_command(row(launcher="claude --model zhipu,glm-5.2"), "/home/u/proj")
+    assert cmd == f"claude --model zhipu,glm-5.2 --resume {UUID}"
 
 
 def test_cwd_with_spaces_is_quoted():

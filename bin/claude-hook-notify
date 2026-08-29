@@ -123,6 +123,37 @@ if [ -n "$session_id" ] && [ -n "$cwd" ]; then
   printf '%s' "$session_id" > "$map_dir/${cwd_key}__${name_key}"
   pane_pid=$(tmux display-message -t "${session}:${win}" -p "#{pane_pid}" 2>/dev/null || true)
   [ -n "$pane_pid" ] && printf '%s' "$session_id" > "$map_dir/pid__${pane_pid}"
+
+  # --- claude-launcher: session_id → команда, которой сессию запускали ---
+  # Без этого restore печатает голый `claude`, и сессия, начатая обёрткой,
+  # возвращается на другой модели со старым транскриптом — выглядит как
+  # успешное восстановление ровно до момента, когда меняются ответы.
+  #
+  # Два источника, оба бесплатные. Обёртка объявляет себя сама
+  # (`export FLOW_LAUNCHER=claude-glm`) — хук наследует окружение claude и
+  # просто читает переменную. Если её нет, но модель задана флагом, ищем
+  # `--model` в argv самого claude, поднимаясь по цепочке родителей.
+  launcher="${FLOW_LAUNCHER:-}"
+  if [ -z "$launcher" ]; then
+    lp="$PPID"; depth=10
+    while [ "${lp:-0}" -gt 1 ] && [ "$depth" -gt 0 ]; do
+      depth=$((depth - 1))
+      argv=$(tr '\0' '\n' < /proc/"$lp"/cmdline 2>/dev/null || true)
+      if [ "$(basename "$(echo "$argv" | head -1)" 2>/dev/null)" = "claude" ]; then
+        model=$(echo "$argv" | awk '/^--model$/{getline; print; exit}')
+        [ -n "$model" ] && launcher="claude --model $model"
+        break
+      fi
+      lstat=$(cat /proc/"$lp"/stat 2>/dev/null || echo "")
+      [ -z "$lstat" ] && break
+      lp=$(echo "${lstat##*)}" | awk '{print $2}')
+    done
+  fi
+  if [ -n "$launcher" ]; then
+    launcher_dir="$HOME/.tmux/claude-launcher"
+    mkdir -p "$launcher_dir"
+    printf '%s' "$launcher" > "$launcher_dir/${session_id}"
+  fi
 fi
 
 current_color=$(get_tab_color "$session" "$win")

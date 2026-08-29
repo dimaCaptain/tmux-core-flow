@@ -27,7 +27,19 @@ from dataclasses import dataclass
 
 RETAIN_DAYS = 30
 
-_COLUMNS = ("target", "window", "cwd", "uuid", "activity", "seen")
+_COLUMNS = ("target", "window", "cwd", "uuid", "activity", "seen", "launcher")
+_LEGACY_COLUMNS = _COLUMNS[:-1]
+
+DEFAULT_LAUNCHER = "claude"
+
+# A launcher is typed into a shell, so it is constrained to what a command and
+# its model argument actually need: names, paths, dots, commas, dashes. Anything
+# else — a quote, a semicolon, a backtick — means the file is not what we wrote,
+# and the answer to that is the default, not a best effort at running it.
+_LAUNCHER_OK = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-_./,= "
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +52,12 @@ class Row:
     uuid     Claude Code session id, the argument to `claude --resume`
     activity epoch of the last transcript write — when the session last did work
     seen     epoch when this row was last confirmed against a live tmux window
+    launcher command that starts this session, minus `--resume <uuid>`
+
+    `launcher` is what makes a restore land on the same model it left. Sessions
+    started through a wrapper — one that exports `FLOW_LAUNCHER`, or one that
+    passes `--model` — resume through the same wrapper; everything else resumes
+    as plain `claude`, which is what the field defaults to.
     """
 
     target: str
@@ -48,6 +66,7 @@ class Row:
     uuid: str
     activity: int
     seen: int
+    launcher: str = DEFAULT_LAUNCHER
 
 
 def encode_cwd(path: str) -> str:
@@ -77,6 +96,19 @@ def _clean(value: str) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
 
 
+def sanitize_launcher(value: str) -> str:
+    """A launcher safe to type into a shell, or the default.
+
+    The value ends up on somebody's command line, so it is validated rather
+    than trusted: an unreadable or tampered file must degrade to plain
+    `claude`, never to something the shell will interpret.
+    """
+    value = (value or "").strip()
+    if not value or any(c not in _LAUNCHER_OK for c in value):
+        return DEFAULT_LAUNCHER
+    return value
+
+
 def format_index(rows: list[Row]) -> str:
     """Render rows as the on-disk TSV, newest activity first."""
     out = ["#" + "\t".join(_COLUMNS)]
@@ -90,6 +122,7 @@ def format_index(rows: list[Row]) -> str:
                     _clean(r.uuid),
                     str(r.activity),
                     str(r.seen),
+                    sanitize_launcher(_clean(r.launcher)),
                 )
             )
         )
@@ -108,11 +141,16 @@ def parse_index(text: str) -> list[Row]:
         if not line.strip() or line.startswith("#"):
             continue
         parts = line.split("\t")
+        # An index written before launchers existed has one column fewer, and
+        # is still a perfectly good index — those sessions resume as `claude`.
+        if len(parts) == len(_LEGACY_COLUMNS):
+            parts = parts + [DEFAULT_LAUNCHER]
         if len(parts) != len(_COLUMNS):
             continue
-        target, window, cwd, uuid, activity, seen = parts
+        target, window, cwd, uuid, activity, seen, launcher = parts
         try:
-            rows.append(Row(target, window, cwd, uuid, int(activity), int(seen)))
+            rows.append(Row(target, window, cwd, uuid, int(activity), int(seen),
+                            sanitize_launcher(launcher)))
         except ValueError:
             continue
     return rows
@@ -177,6 +215,6 @@ def render(rows: list[Row], now: int | None = None) -> str:
         age = humanize(now - r.activity)
         lines.append(
             f"  {r.target:<{w_target}}  {project:<{w_proj}}  {age:>4} ago  "
-            f"claude --resume {r.uuid}"
+            f"{sanitize_launcher(r.launcher)} --resume {r.uuid}"
         )
     return "\n".join(lines) + "\n"

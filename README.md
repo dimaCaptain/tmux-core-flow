@@ -136,6 +136,23 @@ That check matters because a pane running a long-lived script reports its
 the actual argv, a resume command lands in your status widget instead of your
 shell. A window with no idle pane is reported as blocked rather than guessed at.
 
+What gets typed is the command the session was **started** with, not always
+plain `claude`:
+
+```
+main:3    agent-control   4d ago   claude-glm --resume eb5fbcfd-…
+kvant:2   finance         9d ago   claude --resume a6966a0e-…
+```
+
+Resuming a session through the wrong entry point looks like it worked — the
+transcript loads, and only the answers tell you a different model is behind
+them. So the hook records the launcher, keyed by session
+([`docs/state-format.md`](docs/state-format.md#4-launcher--tmuxclaude-launcheruuid)):
+a wrapper that exports `FLOW_LAUNCHER` is remembered by name, a bare
+`--model` on the command line is remembered as itself, and everything else is
+plain `claude`. A launcher that is not on this machine's `PATH` falls back to
+`claude` rather than typing a command that cannot run.
+
 ## Surviving the machine
 
 A reboot is the cheap case — the disk is still there. `flow-sync` covers the

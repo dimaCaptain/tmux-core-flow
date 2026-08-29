@@ -1,6 +1,6 @@
 # State format
 
-`claude-hook-notify` publishes agent state in three places. All of them are
+`claude-hook-notify` publishes agent state in four places. All of them are
 plain files or plain tmux options — no daemon, no socket, no database. Read them
 from any language to build your own status widget.
 
@@ -83,7 +83,37 @@ Given a UUID you can read the transcript at:
 Prefer `pid__*` when you have the pane PID — it is unambiguous. Fall back to the
 name key otherwise.
 
-## 4. Session index — `~/.tmux/claude-sessions.tsv`
+## 4. Launcher — `~/.tmux/claude-launcher/<uuid>`
+
+One line: the command this session was started with, without `--resume <uuid>`.
+Keyed by session UUID, because the launcher belongs to the session — move it to
+another window and it still has to come back the same way.
+
+It exists because resuming through the wrong entry point looks like it worked.
+A session started on GLM and resumed with plain `claude` loads the same
+transcript and answers as a different model, and nothing on screen says so.
+
+Two sources, in order:
+
+| Source | When |
+|---|---|
+| `$FLOW_LAUNCHER` | a wrapper exported it — the hook runs as a child of Claude, so it just reads the variable |
+| `--model X` in Claude's argv | no wrapper announced itself, but a model was pinned on the command line; recorded as `claude --model X` |
+
+Neither present means plain `claude`, and nothing is written.
+
+If you wrap Claude Code, one line makes your wrapper restorable:
+
+```bash
+export FLOW_LAUNCHER=claude-glm     # before exec claude …
+```
+
+Consumers must treat the value as untrusted input — it ends up on a command
+line. `flow_sessions.sanitize_launcher` allows only what a command and a model
+argument need, and returns `claude` for anything else; `flow-restore` also
+falls back when the program is not on this machine's `PATH`.
+
+## 5. Session index — `~/.tmux/claude-sessions.tsv`
 
 The three surfaces above describe *now*. This one describes *what was there*,
 so it still answers after a reboot — when tmux comes back (via resurrect or
@@ -94,8 +124,8 @@ Maintained by `flow-session-index`, which joins live tmux windows against
 activity first:
 
 ```
-#target	window	cwd	uuid	activity	seen
-pet-projects:3	claude	/home/you/work/proj	3bcad249-…	1784998162	1784998308
+#target	window	cwd	uuid	activity	seen	launcher
+pet-projects:3	claude	/home/you/work/proj	3bcad249-…	1784998162	1784998308	claude
 ```
 
 | Column | Meaning |
@@ -106,6 +136,11 @@ pet-projects:3	claude	/home/you/work/proj	3bcad249-…	1784998162	1784998308
 | `uuid` | the argument to `claude --resume` |
 | `activity` | epoch of the last transcript write |
 | `seen` | epoch this row was last confirmed against a live window |
+| `launcher` | command that starts this session, minus `--resume <uuid>` |
+
+An index written before `launcher` existed has six columns and still parses —
+those rows resume as plain `claude`.
+
 Two rules make it durable, and both exist because the obvious implementation
 fails at exactly these points:
 
@@ -138,7 +173,9 @@ the `cwd` column of the index. See [`sync.md`](sync.md).
 
 ## Stability
 
-The colours, the four keys, the two map filenames, and the session index columns
-are the public surface and will not change silently. The rest — the internal
+The colours, the four keys, the two map filenames, the launcher file and the
+session index columns are the public surface and will not change silently.
+Columns are only ever appended, and a reader must accept a row that is short by
+the columns it does not know. The rest — the internal
 order of checks, how the hook finds its window by walking the PPID chain — is
 free to change.

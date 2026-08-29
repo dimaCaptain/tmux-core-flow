@@ -16,8 +16,9 @@ DAY = 86400
 NOW = 1_700_000_000
 
 
-def row(target="main:1", uuid="uuid-a", activity=NOW, seen=NOW, cwd="/home/u/proj", window="claude"):
-    return fs.Row(target, window, cwd, uuid, activity, seen)
+def row(target="main:1", uuid="uuid-a", activity=NOW, seen=NOW, cwd="/home/u/proj",
+        window="claude", launcher="claude"):
+    return fs.Row(target, window, cwd, uuid, activity, seen, launcher)
 
 
 # --- key encoding: must match what claude-hook-notify writes ---
@@ -34,7 +35,45 @@ def test_project_dir_keeps_leading_dash():
     assert fs.project_dir("/home/you/work/my_project") == "-home-you-work-my-project"
 
 
+# --- launcher: how the session has to come back ---
+
+def test_launcher_defaults_to_plain_claude():
+    assert row().launcher == "claude"
+
+
+def test_sanitize_accepts_a_wrapper_and_a_model_flag():
+    assert fs.sanitize_launcher("claude-glm") == "claude-glm"
+    assert fs.sanitize_launcher("claude --model zhipu,glm-5.2") == "claude --model zhipu,glm-5.2"
+
+
+def test_sanitize_refuses_anything_the_shell_would_interpret():
+    """The value is typed into a prompt. A tampered or corrupt file must
+    degrade to plain `claude`, not to something that runs."""
+    for bad in ("claude; rm -rf /", "claude && curl x|sh", "claude `id`", "claude $(id)", ""):
+        assert fs.sanitize_launcher(bad) == "claude"
+
+
+def test_render_pastes_the_launcher_not_bare_claude():
+    """Every line of the human view is meant to be pasteable as-is, which it
+    is not if it names the wrong binary."""
+    assert "claude-glm --resume uuid-a" in fs.render([row(launcher="claude-glm")], NOW)
+
+
 # --- on-disk format ---
+
+def test_an_index_written_before_launchers_still_parses():
+    """Six columns is what every existing index on disk has. Rejecting those
+    rows would empty the index of exactly the sessions a restore needs."""
+    legacy = "#target\twindow\tcwd\tuuid\tactivity\tseen\n" \
+             "main:1\tclaude\t/home/u/proj\tuuid-a\t100\t100\n"
+    rows = fs.parse_index(legacy)
+    assert len(rows) == 1 and rows[0].launcher == "claude"
+
+
+def test_launcher_survives_the_roundtrip():
+    rows = [fs.Row("main:1", "claude", "/home/u/p", "uuid-a", NOW, NOW, "claude-gemini")]
+    assert fs.parse_index(fs.format_index(rows))[0].launcher == "claude-gemini"
+
 
 def test_format_parse_roundtrip():
     rows = [row(target="a:1"), row(target="b:2", uuid="uuid-b")]

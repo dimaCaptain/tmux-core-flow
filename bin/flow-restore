@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -178,10 +179,24 @@ def classify(rows: list[fs.Row], windows: dict[str, list[Pane]]) -> list[tuple[f
     return out
 
 
+def launcher_for(row: fs.Row) -> str:
+    """The wrapper this session was started through, if it still exists.
+
+    A session started through `claude-glm` has to come back through it, or it
+    comes back on a different model with the old transcript — which looks like
+    a working restore right up until the answers change. When the wrapper is
+    gone from this machine, plain `claude` is the honest fallback: it resumes
+    the context, and the model is visible to you in the first reply.
+    """
+    launcher = fs.sanitize_launcher(row.launcher)
+    program = launcher.split(" ", 1)[0]
+    return launcher if shutil.which(program) else fs.DEFAULT_LAUNCHER
+
+
 def resume_command(row: fs.Row, pane_cwd: str) -> str:
     """The command to type. Includes a `cd` when the pane sits elsewhere,
     because `--resume` only finds a session from its own project directory."""
-    resume = f"claude --resume {row.uuid}"
+    resume = f"{launcher_for(row)} --resume {row.uuid}"
     if pane_cwd != row.cwd:
         return f"cd {shlex.quote(row.cwd)} && {resume}"
     return resume
@@ -256,7 +271,8 @@ def main(argv: list[str]) -> int:
         for row, state in sorted(pairs, key=lambda p: (-p[0].activity, p[0].target)):
             project = row.cwd.rstrip("/").split("/")[-1] or "/"
             print("\t".join((row.target, row.window, project, row.cwd,
-                             row.uuid, str(row.activity), state)))
+                             row.uuid, str(row.activity), state,
+                             launcher_for(row))))
         return 0
 
     chosen = select(pairs, targets, want_all)

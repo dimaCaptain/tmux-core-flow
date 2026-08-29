@@ -45,6 +45,7 @@ PROJECTS_DIR = os.environ.get("FLOW_CLAUDE_PROJECTS") or os.path.expanduser("~/.
 INDEX = os.path.join(STATE_DIR, "claude-sessions.tsv")
 HUMAN = os.path.join(STATE_DIR, "claude-sessions.txt")
 MAP_DIR = os.path.join(STATE_DIR, "claude-map")
+LAUNCHER_DIR = os.path.join(STATE_DIR, "claude-launcher")
 
 # tmux gives us the active pane of each window, which is the one a session runs in.
 _FORMAT = "#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{pane_pid}"
@@ -92,6 +93,16 @@ def lookup_uuid(cwd: str, window: str, pane_pid: str) -> str:
     return _read(os.path.join(MAP_DIR, f"{fs.encode_cwd(cwd)}__{window.replace('/', '-')}"))
 
 
+def lookup_launcher(uuid: str) -> str:
+    """How this session was started, or plain `claude`.
+
+    Keyed by session UUID rather than by window, because the launcher belongs
+    to the session: move it to another window and it still has to come back
+    through the same wrapper, or it comes back on a different model.
+    """
+    return fs.sanitize_launcher(_read(os.path.join(LAUNCHER_DIR, uuid)))
+
+
 def last_activity(uuid: str, cwd: str) -> int | None:
     """Transcript mtime, or None when there is no transcript.
 
@@ -118,7 +129,8 @@ def scan(now: int) -> list[fs.Row]:
         activity = last_activity(uuid, cwd)
         if activity is None:
             continue
-        rows.append(fs.Row(target, window, cwd, uuid, activity, now))
+        rows.append(fs.Row(target, window, cwd, uuid, activity, now,
+                           lookup_launcher(uuid)))
     return rows
 
 
