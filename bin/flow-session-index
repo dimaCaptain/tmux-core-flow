@@ -26,6 +26,7 @@ lib/flow_sessions.merge.
 """
 from __future__ import annotations
 
+import dataclasses
 import glob
 import os
 import subprocess
@@ -147,11 +148,35 @@ def load_index() -> list[fs.Row]:
     return fs.parse_index(_read(INDEX))
 
 
+def refresh_launchers(rows: list[fs.Row]) -> list[fs.Row]:
+    """Re-read the launcher of every row that has a record on disk.
+
+    `merge` only replaces rows it can see in tmux right now; a window whose
+    session is no longer detectable is retained verbatim, launcher and all.
+    That was fine while the only writer was the hook, which records a session
+    the moment it starts. It stopped being fine once launchers could also be
+    filled in after the fact: the record would land on disk and the retained
+    row would keep saying `claude` forever.
+
+    The record is keyed by uuid and the row names the same session, so the
+    record is simply the better answer. Rows without one are left alone —
+    `lookup_launcher` would answer `claude` for a missing file, and that would
+    overwrite a good stored value with the default.
+    """
+    out = []
+    for row in rows:
+        if os.path.exists(os.path.join(LAUNCHER_DIR, row.uuid)):
+            out.append(dataclasses.replace(row, launcher=lookup_launcher(row.uuid)))
+        else:
+            out.append(row)
+    return out
+
+
 def update() -> int:
     os.makedirs(STATE_DIR, exist_ok=True)
     now = int(time.time())
     old = load_index()
-    merged = fs.merge(old, scan(now), now)
+    merged = refresh_launchers(fs.merge(old, scan(now), now))
     if not merged and old:
         # Cannot happen via merge, which retains; a belt-and-braces refusal to
         # ever trade a populated index for an empty one.

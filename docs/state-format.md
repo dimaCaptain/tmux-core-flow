@@ -102,6 +102,13 @@ Two sources, in order:
 
 Neither present means plain `claude`, and nothing is written.
 
+The record is authoritative, not a one-time reading: every `flow-session-index
+--update` re-reads it for every row that has one, including rows tmux can no
+longer show. That is what makes a launcher recoverable after the fact — a
+session that predates the hook, or one the orchestrator started by calling the
+binary directly, can have its record written later and the index will pick it
+up on the next tick. A row with no record keeps whatever it already had.
+
 If you wrap Claude Code, one line makes your wrapper restorable:
 
 ```bash
