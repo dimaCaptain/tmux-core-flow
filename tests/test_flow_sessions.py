@@ -35,6 +35,13 @@ def test_project_dir_keeps_leading_dash():
     assert fs.project_dir("/home/you/work/my_project") == "-home-you-work-my-project"
 
 
+def test_project_dir_folds_a_dot_directory():
+    # A git worktree under ~/work/.worktrees is the common case: Claude Code
+    # turns the dot into a dash too, so the slug carries a double dash.
+    assert (fs.project_dir("/home/you/work/.worktrees/feat")
+            == "-home-you-work--worktrees-feat")
+
+
 # --- launcher: how the session has to come back ---
 
 def test_launcher_defaults_to_plain_claude():

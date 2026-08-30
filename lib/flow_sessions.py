@@ -83,12 +83,17 @@ def encode_cwd(path: str) -> str:
 def project_dir(cwd: str) -> str:
     """Working directory in `~/.claude/projects/` directory-name form.
 
-    `/home/you/work/my_project` -> `-home-you-work-my-project`
+    `/home/you/work/my_project`      -> `-home-you-work-my-project`
+    `/home/you/work/.worktrees/feat` -> `-home-you-work--worktrees-feat`
 
-    The same substitution as `encode_cwd` but keeping the leading `-`. Claude
-    Code owns this one; we only read it.
+    Claude Code owns this one; we only read it. It folds `.` as well as `/`
+    and `_`, which is why a dot-directory shows up as a double dash. Missing
+    that made every session under `~/work/.worktrees/` look like it had no
+    transcript, so `flow-restore` silently skipped those windows.
+
+    Unlike `encode_cwd` the leading `-` stays.
     """
-    return cwd.replace("/", "-").replace("_", "-")
+    return cwd.replace("/", "-").replace("_", "-").replace(".", "-")
 
 
 def _clean(value: str) -> str:
